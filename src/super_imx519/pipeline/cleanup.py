@@ -1,7 +1,8 @@
 """正面図から、4 隅のマーカーの板とカラーカードを消して、壁で埋める。
 
 埋め方（服の画素には手を加えない）:
-- 色: 消す範囲の外側の帯から、壁の色を 2 次曲面で当てはめる（照明のむらに沿う）
+- 色: 消す範囲の外の壁から、粗い解像度で順に埋める（pull-push）。縁で周りの壁と必ず一致するので、
+  照明のむらが複雑でも段差が出ない（2 次曲面で当てはめると、縁で食い違って四角い跡が見えた）
 - 質感: 近くの壁から小さなブロックを集めて重ね、細かい凹凸とむら（σ 20 px より細かい成分）を足す。
   ブロックの重なりは、分散が変わらないよう重みを正規化してなじませる
 - 影: 板やカードには厚みがあり、壁に影が落ちる。物の縁から 40 mm 以内で、当てはめた壁より少し暗い
@@ -28,6 +29,24 @@ KERNEL = np.ones((3, 3), np.uint8)
 
 def _dilate(mask: np.ndarray, px: float) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), KERNEL, iterations=max(int(px), 1)) > 0
+
+
+def pull_push(values: np.ndarray, weight: np.ndarray) -> np.ndarray:
+    """weight（0〜1）が 0 の所を、周りの値から埋める。半分ずつ縮めて平均し、粗いほうから戻す。
+
+    weight が 1 の所は元の値のまま。埋めた所は、縁では周りと一致し、内側ほどなめらかになる。
+    """
+    h, w = weight.shape
+    if min(h, w) <= 4:
+        mean = (values * weight[..., None]).sum(axis=(0, 1)) / max(float(weight.sum()), 1e-6)
+        return np.ones_like(values) * mean.astype(values.dtype)
+    half = ((w + 1) // 2, (h + 1) // 2)
+    vw = cv2.resize(values * weight[..., None], half, interpolation=cv2.INTER_AREA)
+    ww = cv2.resize(weight, half, interpolation=cv2.INTER_AREA)
+    small = vw / np.maximum(ww, 1e-6)[..., None]
+    coarse = pull_push(small, np.clip(ww * 4, 0, 1))
+    up = cv2.resize(coarse, (w, h), interpolation=cv2.INTER_LINEAR)
+    return values * weight[..., None] + up * (1 - weight[..., None])
 
 
 def _poly_mask(shape: tuple[int, ...], poly: np.ndarray) -> np.ndarray:
@@ -134,16 +153,28 @@ class WallFiller:
         synth = acc / np.sqrt(np.maximum(acc_w2, 1e-6))
         return synth[fy - y0, fx - x0]
 
-    def fill(self, mask: np.ndarray, keep_protected: bool = True, degree: int = 2) -> int:
-        """mask を埋める。縁は元の画像となめらかにつなぐ。埋めた画素数を返す。"""
+    def fill(self, mask: np.ndarray, keep_protected: bool = True) -> int:
+        """mask を埋める。埋めた画素数を返す。"""
         inner = _dilate(mask, RING_MM[0] * self.px)
         if keep_protected:
             inner &= mask | ~self.protect
-        fy, fx, smooth = self.fit(mask, inner, degree)
-        fill = smooth + self.synth_texture(fy, fx)
-        alpha = cv2.GaussianBlur(inner.astype(np.float32), (0, 0), 2.0)[fy, fx][:, None]
-        alpha = np.where(mask[fy, fx][:, None], 1.0, alpha)
-        self.image[fy, fx] = alpha * fill + (1 - alpha) * self.image[fy, fx]
+        fy, fx = np.nonzero(inner)
+        if len(fy) == 0:
+            return 0
+        # 色: 周りの壁から pull-push で。まだ消していない物・服・写っていない所は手がかりにしない
+        margin = int(RING_MM[1] * self.px) + BLOCK
+        h, w = mask.shape
+        y0, y1 = max(fy.min() - margin, 0), min(fy.max() + margin + 1, h)
+        x0, x1 = max(fx.min() - margin, 0), min(fx.max() + margin + 1, w)
+        known = self.valid & ~self.protect & ~self.unfilled & ~inner
+        base = pull_push(
+            self.image[y0:y1, x0:x1].astype(np.float32),
+            known[y0:y1, x0:x1].astype(np.float32),
+        )
+        if not known[y0:y1, x0:x1].any():
+            raise ValueError("消す範囲の周りに壁が写っていません")
+        fill = base[fy - y0, fx - x0] + self.synth_texture(fy, fx)
+        self.image[fy, fx] = fill
         self.unfilled &= ~inner
         return len(fy)
 

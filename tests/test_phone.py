@@ -99,19 +99,15 @@ def test_card_correction_recovers_reference_colors():
     assert c.delta_e_after.mean() < 1.5 < c.delta_e_before.mean()
 
 
-def test_crop_keeps_hook_position_and_zooms_out_for_long_garments():
+def test_crop_is_fixed_by_the_wall_not_by_the_garment():
     layout = framing.Layout(width_mm=900, hook_cut_mm=40)
     hook = (1000.0, 200.0)
-    (x0, y0, w, h), scale = framing.crop_box(hook, MM, layout, (800, 450, 1200, 2200))
-    assert scale == 1.0 and (w, h) == (1800, 2700)
-    assert x0 + w / 2 == pytest.approx(hook[0]) and y0 == 280
-    # ロングコート: 裾が 1350 mm を超える → 引く。フックの位置の割合（中央・上から cut/h）は同じ
-    (x0, y0, w, h), scale = framing.crop_box(hook, MM, layout, (800, 450, 1200, 3400))
-    assert scale > 1
-    assert y0 + h >= 3400 + 0.05 * h - 1
-    assert x0 + w / 2 == pytest.approx(hook[0], abs=1)
-    assert (y0 - hook[1]) / h == pytest.approx(80 / 2700, rel=0.01)
-    assert w / h == pytest.approx(2 / 3, rel=0.01)
+    box = framing.crop_box(hook, MM, layout)
+    assert box == (100, 280, 1800, 2700)  # フックが左右の中央、上の端から 40 mm 下
+    assert framing.overflow(box, (800, 450, 1200, 2200)) == []
+    # ロングコート: 引かずに、はみ出しを知らせる
+    assert framing.overflow(box, (800, 450, 1200, 3400)) == ["下"]
+    assert framing.overflow(box, (50, 450, 1950, 2200)) == ["左", "右"]
 
 
 @pytest.mark.parametrize("garment_h_mm", [900.0, 1500.0])
@@ -136,10 +132,9 @@ def test_process_upload_makes_clean_portrait(tmp_path, garment_h_mm):
     # フックは左右の中央、上の端の近く
     crop = report["crop"]
     assert crop["hook_px"][0] == pytest.approx(crop["box_px"][0] + crop["box_px"][2] / 2, abs=2)
-    if garment_h_mm > 1300:
-        assert crop["scale"] > 1 and any("引いて" in w for w in report["warnings"])
-    else:
-        assert crop["scale"] == 1.0 and crop["width_mm"] == pytest.approx(900, abs=1)
+    assert crop["width_mm"] == pytest.approx(900, abs=1)  # 服の大きさで縮尺を変えない
+    overflowed = any("はみ出して" in w for w in report["warnings"])
+    assert overflowed == (garment_h_mm > 1300)
 
 
 def test_fit_layout_recovers_tilted_boards_from_several_views():

@@ -1,7 +1,8 @@
 """服（とハンガー・フック）を見つけ、商品画像の構図（縦 2:3）で切り出す範囲を決める。
 
 構図は 85-store の商品画像に合わせる: 壁のフックが上の端に少し掛かり、服はフックの真下で左右の
-中央。縮尺は実寸（壁面座標の mm）で固定し、どの商品も同じ大きさに写るようにする。
+中央。枠は壁面座標（mm）で決まった四角で、服の大きさでは変えない。どの商品も同じ位置から同じ画角で
+撮ったように揃い、小さい服は小さく、大きい服は大きく写る（はみ出すときは知らせるだけ）。
 
 服の見つけ方: 壁を Lab の滑らかな面（2 次曲面）で当てはめ、そこからの差で前景を決める。
 服が壁に落とす影は「少し暗く、色はほぼ同じ」なので、次のどれかに当たるものだけを前景にする。
@@ -23,11 +24,9 @@ FIT_STEP = 8  # 壁の面を当てはめるときの間引き
 
 @dataclass
 class Layout:
-    width_mm: float = 900.0  # 切り出す幅（実寸）。どの商品も、まずこの縮尺で切り出す
+    width_mm: float = 900.0  # 切り出す幅（実寸）。どの商品も同じ
     aspect: float = 3 / 2  # 高さ / 幅
     hook_cut_mm: float = 40.0  # フックの上端から、上の端までを下げる量（フックが端に掛かる）
-    bottom_margin: float = 0.05  # 服の裾の下に、少なくとも高さのこの割合を空ける
-    side_margin: float = 0.05  # 服の左右に、少なくとも幅のこの割合を空ける
     side: int = 2048  # 書き出す長辺の上限
 
 
@@ -47,9 +46,16 @@ def foreground_mask(
     keep = usable[ys, xs]
     samples = lab[ys, xs][keep]
     a = _design(xs[keep].astype(np.float64), ys[keep].astype(np.float64), w, h)
-    # 服が大きく写っていても壁に合うよう、外れた画素を除いて当てはめ直す
-    inliers = np.ones(len(samples), bool)
-    for _ in range(4):
+    # 服が大きく写っていても壁に合うよう、外れた画素を除いて当てはめ直す。最初は、写っている範囲の
+    # 縁の近く（ほぼ壁）の色に近い画素だけを使う（暗い服に引っ張られないように）
+    rim_px = max(w // 8, 3)
+    inner = cv2.erode(usable.astype(np.uint8), np.ones((rim_px, rim_px), np.uint8))
+    rim = (usable & (inner == 0))[ys, xs][keep]
+    wall_color = np.median(samples[rim] if rim.sum() > 100 else samples, axis=0)
+    inliers = np.linalg.norm(samples - wall_color, axis=1) < 20
+    if inliers.sum() < 100:
+        inliers[:] = True
+    for _ in range(6):
         coef, *_ = np.linalg.lstsq(a[inliers], samples[inliers], rcond=None)
         resid = np.linalg.norm(a @ coef - samples, axis=1)
         inliers = resid < max(3.0 * np.median(resid[inliers]), 2.0)
@@ -102,39 +108,43 @@ def find_hook(
     if not blobs:
         return cx, float(top)
     hook = min(blobs, key=lambda i: stats[i, cv2.CC_STAT_TOP])
-    hy = y0 + stats[hook, cv2.CC_STAT_TOP]
-    hx = x0 + stats[hook, cv2.CC_STAT_LEFT] + stats[hook, cv2.CC_STAT_WIDTH] / 2
-    return float(hx), float(hy)
+    top_row = stats[hook, cv2.CC_STAT_TOP]
+    # 横の位置は上端の 15 mm だけで決める（下はハンガーの曲がった首につながっていることがある）
+    band = labels[top_row : top_row + int(15 * px)] == hook
+    hx = x0 + float(np.median(np.nonzero(band)[1]))
+    return hx, float(y0 + top_row)
 
 
 def crop_box(
-    hook: tuple[float, float],
-    mm_per_px: float,
-    layout: Layout,
-    garment: tuple[int, int, int, int] | None = None,
-) -> tuple[tuple[int, int, int, int], float]:
-    """((x0, y0, 幅, 高さ), 縮尺の倍率)。正面図の画素。画像の外に出ることもある（呼ぶ側で埋める）。
+    hook: tuple[float, float], mm_per_px: float, layout: Layout
+) -> tuple[int, int, int, int]:
+    """(x0, y0, 幅, 高さ)。正面図の画素。フックを左右の中央・上の端に置いた、決まった大きさの枠。
 
-    フックは常に左右の中央・上の端から同じ割合の位置に置く（ショップで見たときにハンガーの位置が
-    揃う）。服（garment = x0, y0, x1, y1）が決まった大きさに収まらないとき（ロングコートなど）は、
-    フックの位置の割合を保ったまま、収まるところまで引く（倍率 > 1）。
+    画像の外に出ることもある（呼ぶ側で埋める）。
     """
     px = 1 / mm_per_px
-    width = layout.width_mm * px
-    height = width * layout.aspect
-    cut = layout.hook_cut_mm * px
-    scale = 1.0
-    if garment is not None:
-        gx0, _, gx1, gy1 = garment
-        # 裾: 上の端（フック + cut·s）から裾 + 余白までが高さ·s に収まる倍率
-        need_down = (gy1 - hook[1]) / (height * (1 - layout.bottom_margin) - cut)
-        # 左右: フックからの遠い方の端 + 余白が、幅·s の半分に収まる倍率
-        reach = max(hook[0] - gx0, gx1 - hook[0])
-        need_side = reach / (width * (0.5 - layout.side_margin))
-        scale = max(1.0, need_down, need_side)
-    w, h, c = width * scale, height * scale, cut * scale
-    box = (int(round(hook[0] - w / 2)), int(round(hook[1] + c)), int(round(w)), int(round(h)))
-    return box, scale
+    w = layout.width_mm * px
+    h = w * layout.aspect
+    return (
+        int(round(hook[0] - w / 2)),
+        int(round(hook[1] + layout.hook_cut_mm * px)),
+        int(round(w)),
+        int(round(h)),
+    )
+
+
+def overflow(box: tuple[int, int, int, int], garment: tuple[int, int, int, int]) -> list[str]:
+    """服（x0, y0, x1, y1）が枠からはみ出している向き（"左"・"右"・"下"）。"""
+    x0, y0, w, h = box
+    gx0, _, gx1, gy1 = garment
+    sides = []
+    if gx0 < x0:
+        sides.append("左")
+    if gx1 >= x0 + w:
+        sides.append("右")
+    if gy1 >= y0 + h:
+        sides.append("下")
+    return sides
 
 
 def sharp_edges(bgr: np.ndarray, mm_per_px: float, threshold: float = 30.0) -> np.ndarray:
