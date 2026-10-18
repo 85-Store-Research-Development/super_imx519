@@ -7,6 +7,8 @@
   results/<id>/final.jpg を作る
 - 撮影アプリ（imx519_edge）は /api/sessions で状態と進捗を、
   /api/sessions/<id>/preview.jpg で完成画像を読む
+- iPhone カメラモード: 撮影アプリが中継したスマホの写真（JPEG / DNG）を /api/uploads で受け取り、
+  uploads/<id>/ に置いて、1 枚ずつ商品画像にする（pipeline/phone.py）。結果は results/uploads/<id>/
 
 usage:
     uv run python -m super_imx519.studio --host 100.108.168.101 --port 8520
@@ -17,19 +19,25 @@ import contextlib
 import json
 import logging
 import re
+import secrets
+import shutil
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from .ingest import DEFAULT_DEST, Edge, ingest_session
+from .pipeline.phone import SUFFIXES, process_upload
 from .pipeline.process import process_session
 
 log = logging.getLogger("super_imx519.studio")
 SESSION_ID = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{6}(_c[0-9]+)?$")
+UPLOAD_ID = re.compile(r"^u[0-9]{8}-[0-9]{6}-[0-9a-f]{6}$")
+MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # iPhone の ProRAW（48MP）は約 70 MB
 DEFAULT_RESULTS = Path("~/data/super_imx519/results").expanduser()
 DEFAULT_EDGE = "https://85pi.taila713c8.ts.net:12443"
 
@@ -43,11 +51,14 @@ class Studio:
         interval_s: float = 10.0,
         process: Callable = process_session,
         ingest: Callable = ingest_session,
+        uploads_dir: Path | None = None,
+        process_upload: Callable = process_upload,
     ):
         self.sessions_dir, self.results_dir = sessions_dir, results_dir
+        self.uploads_dir = uploads_dir or sessions_dir.parent / "uploads"
         self.edge, self.interval_s = edge, interval_s
-        self.process, self.ingest = process, ingest
-        self.active: dict[str, dict] = {}  # 取り込み中・処理中のセッション → 進み具合
+        self.process, self.ingest, self.process_upload = process, ingest, process_upload
+        self.active: dict[str, dict] = {}  # 取り込み中・処理中のセッションとアップロード → 進み具合
         self.edge_sessions: dict[str, dict] = {}
         self.edge_error: str | None = None
         self.checked_at: float | None = None
@@ -58,8 +69,8 @@ class Studio:
     # --- 常駐 ---
 
     def start(self) -> None:
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        self.results_dir.mkdir(parents=True, exist_ok=True)
+        for path in (self.sessions_dir, self.results_dir, self.uploads_dir):
+            path.mkdir(parents=True, exist_ok=True)
         self._running = True
         self._thread = threading.Thread(target=self._loop, name="studio", daemon=True)
         self._thread.start()
@@ -80,7 +91,12 @@ class Studio:
             self._wake.clear()
 
     def cycle(self) -> None:
-        """1 回ぶん: エッジから取り込み、待っているセッションを処理する。"""
+        """1 回ぶん: アップロードを処理し、エッジから取り込み、待っているセッションを処理する。
+
+        アップロードは画面の前で待っている人がいるので先にする。
+        """
+        for upload_id in self.pending_uploads():
+            self._process_upload(upload_id)
         if self.edge:
             self.refresh_edge()
             # 手元に同じものがあっても呼ぶ（中身を照合し、同じならエッジ側を消すだけになる）
@@ -163,6 +179,107 @@ class Studio:
 
     def wake(self) -> None:
         self._wake.set()
+
+    # --- iPhone カメラモード（アップロード） ---
+
+    def add_upload(self, data: bytes, filename: str) -> str:
+        """写真を置いて、処理の順番に入れる。読める形式でなければ ValueError。"""
+        suffix = Path(filename).suffix.lower()
+        if suffix not in SUFFIXES:
+            raise ValueError(
+                f"{suffix or '拡張子なし'} は読めません（JPEG か DNG で送ってください）"
+            )
+        if not data:
+            raise ValueError("中身が空です")
+        upload_id = f"u{datetime.now():%Y%m%d-%H%M%S}-{secrets.token_hex(3)}"
+        path = self.uploads_dir / upload_id
+        path.mkdir(parents=True)
+        (path / f"original{suffix}").write_bytes(data)
+        meta = {
+            "upload_id": upload_id,
+            "filename": Path(filename).name,
+            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "bytes": len(data),
+        }
+        (path / "upload.json").write_text(json.dumps(meta, ensure_ascii=False))
+        self._wake.set()
+        return upload_id
+
+    def _upload_original(self, upload_id: str) -> Path | None:
+        return next((self.uploads_dir / upload_id).glob("original.*"), None)
+
+    def pending_uploads(self) -> list[str]:
+        if not self.uploads_dir.is_dir():
+            return []
+        out = []
+        for path in sorted(self.uploads_dir.iterdir()):
+            if not UPLOAD_ID.match(path.name) or not (path / "upload.json").exists():
+                continue
+            result = self.results_dir / "uploads" / path.name
+            if not (result / "final.jpg").exists() and not (result / "error.txt").exists():
+                out.append(path.name)
+        return out
+
+    def _process_upload(self, upload_id: str) -> None:
+        out = self.results_dir / "uploads" / upload_id
+        self.active[upload_id] = {"state": "processing", "done": 0, "total": 1, "label": "処理待ち"}
+        try:
+            self.process_upload(
+                self._upload_original(upload_id), out, self._progress(upload_id, "processing")
+            )
+            log.info("完成しました: %s", upload_id)
+        except Exception as e:
+            log.exception("処理に失敗しました: %s", upload_id)
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "error.txt").write_text(str(e))
+        finally:
+            self.active.pop(upload_id, None)
+
+    def reprocess_upload(self, upload_id: str) -> None:
+        out = self.results_dir / "uploads" / upload_id
+        for name in ("final.jpg", "preview.jpg", "error.txt", "report.json"):
+            (out / name).unlink(missing_ok=True)
+        self._wake.set()
+
+    def delete_upload(self, upload_id: str) -> None:
+        if upload_id in self.active:
+            raise RuntimeError("処理中は消せません")
+        shutil.rmtree(self.uploads_dir / upload_id, ignore_errors=True)
+        shutil.rmtree(self.results_dir / "uploads" / upload_id, ignore_errors=True)
+
+    def uploads(self, limit: int = 30) -> list[dict]:
+        rows = []
+        if not self.uploads_dir.is_dir():
+            return rows
+        for path in sorted(self.uploads_dir.iterdir(), reverse=True)[:limit]:
+            meta = _read_json(path / "upload.json") if UPLOAD_ID.match(path.name) else None
+            if meta is None:
+                continue
+            result = self.results_dir / "uploads" / path.name
+            active = self.active.get(path.name)
+            error, report = None, None
+            if active:
+                state = active["state"]
+            elif (result / "final.jpg").exists():
+                state = "done"
+                report = _read_json(result / "report.json") or {}
+            elif (result / "error.txt").exists():
+                state, error = "failed", (result / "error.txt").read_text()[:500]
+            else:
+                state = "queued"
+            rows.append(
+                {
+                    **meta,
+                    "state": state,
+                    "progress": {k: active[k] for k in ("done", "total", "label")}
+                    if active
+                    else None,
+                    "error": error,
+                    "final_size": report.get("final_size") if report else None,
+                    "warnings": report.get("warnings", []) if report else [],
+                }
+            )
+        return rows
 
     # --- 状態 ---
 
@@ -279,6 +396,72 @@ def create_app(studio: Studio, manage: bool = False) -> FastAPI:
             raise HTTPException(404, "セッションがありません")
         studio.reprocess(session_id)
         return {"ok": True}
+
+    # --- iPhone カメラモード ---
+
+    def upload_file(upload_id: str, name: str) -> Path:
+        path = studio.results_dir / "uploads" / upload_id / name
+        if not UPLOAD_ID.match(upload_id) or not path.is_file():
+            raise HTTPException(404, "まだ完成していません")
+        return path
+
+    @app.post("/api/uploads", status_code=201)
+    async def upload(request: Request, filename: str):
+        """本文が写真そのもの（multipart ではない）。撮影アプリが中継する。"""
+        length = int(request.headers.get("content-length") or 0)
+        if length > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "大きすぎます")
+        data = await request.body()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "大きすぎます")
+        try:
+            upload_id = studio.add_upload(data, filename)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        log.info("写真を受け取りました: %s（%s、%.1f MB）", upload_id, filename, len(data) / 1e6)
+        return {"upload_id": upload_id}
+
+    @app.get("/api/uploads")
+    def uploads():
+        return studio.uploads()
+
+    @app.get("/api/uploads/{upload_id}/preview.jpg")
+    def upload_preview(upload_id: str):
+        return FileResponse(upload_file(upload_id, "preview.jpg"), media_type="image/jpeg")
+
+    @app.get("/api/uploads/{upload_id}/final.jpg")
+    def upload_final(upload_id: str, download: bool = False):
+        meta = _read_json(studio.uploads_dir / upload_id / "upload.json") or {}
+        stem = Path(meta.get("filename") or "").stem
+        if stem.lower() in ("", "image", "photo"):  # カメラから直接送ると、どれも image.jpg になる
+            stem = upload_id
+        return FileResponse(
+            upload_file(upload_id, "final.jpg"),
+            media_type="image/jpeg",
+            filename=f"{stem}_85store.jpg",
+            content_disposition_type="attachment" if download else "inline",
+        )
+
+    @app.get("/api/uploads/{upload_id}/report.json")
+    def upload_report(upload_id: str):
+        return FileResponse(upload_file(upload_id, "report.json"), media_type="application/json")
+
+    @app.post("/api/uploads/{upload_id}/reprocess")
+    def upload_reprocess(upload_id: str):
+        if not UPLOAD_ID.match(upload_id) or not (studio.uploads_dir / upload_id).is_dir():
+            raise HTTPException(404, "ありません")
+        studio.reprocess_upload(upload_id)
+        return {"ok": True}
+
+    @app.delete("/api/uploads/{upload_id}")
+    def upload_delete(upload_id: str):
+        if not UPLOAD_ID.match(upload_id) or not (studio.uploads_dir / upload_id).is_dir():
+            raise HTTPException(404, "ありません")
+        try:
+            studio.delete_upload(upload_id)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e)) from e
+        return {"deleted": upload_id}
 
     @app.post("/api/wake")
     def wake():

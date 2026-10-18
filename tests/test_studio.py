@@ -123,3 +123,63 @@ def test_session_already_here_is_removed_from_edge(tmp_path):
     studio.cycle()
     assert edge.list == []
     assert [r["state"] for r in studio.sessions()] == ["done"]
+
+
+def make_with_uploads(tmp_path, process_upload=None):
+    def default_process_upload(src, out, progress):
+        progress(2, 6, "傾きの補正")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "preview.jpg").write_bytes(b"\xff\xd8preview")
+        report = {"final_size": [1365, 2048], "warnings": ["テストの注意"], "src": src.name}
+        (out / "report.json").write_text(json.dumps(report))
+        (out / "final.jpg").write_bytes(b"\xff\xd8final")
+
+    studio = make(tmp_path)
+    studio.uploads_dir = tmp_path / "uploads"
+    studio.uploads_dir.mkdir()
+    studio.process_upload = process_upload or default_process_upload
+    return studio
+
+
+def test_uploads_are_processed_and_served(tmp_path):
+    studio = make_with_uploads(tmp_path)
+    client = TestClient(create_app(studio))
+    res = client.post("/api/uploads", params={"filename": "IMG_7402.DNG"}, content=b"II*\x00dng")
+    assert res.status_code == 201
+    upload_id = res.json()["upload_id"]
+    assert (studio.uploads_dir / upload_id / "original.dng").read_bytes() == b"II*\x00dng"
+    [row] = client.get("/api/uploads").json()
+    assert row["state"] == "queued" and row["filename"] == "IMG_7402.DNG"
+
+    studio.cycle()
+    [row] = client.get("/api/uploads").json()
+    assert row["state"] == "done" and row["final_size"] == [1365, 2048]
+    assert row["warnings"] == ["テストの注意"]
+    res = client.get(f"/api/uploads/{upload_id}/final.jpg", params={"download": True})
+    assert res.content == b"\xff\xd8final"
+    assert res.headers["content-disposition"].startswith("attachment")
+    assert "IMG_7402_85store.jpg" in res.headers["content-disposition"]
+    assert client.get(f"/api/uploads/{upload_id}/preview.jpg").content == b"\xff\xd8preview"
+
+    assert client.post(f"/api/uploads/{upload_id}/reprocess").json() == {"ok": True}
+    assert client.get("/api/uploads").json()[0]["state"] == "queued"
+    assert client.delete(f"/api/uploads/{upload_id}").json() == {"deleted": upload_id}
+    assert client.get("/api/uploads").json() == []
+
+
+def test_upload_rejects_unknown_formats_and_keeps_failures(tmp_path):
+    def broken(src, out, progress):
+        raise ValueError("マーカーが写っていません")
+
+    studio = make_with_uploads(tmp_path, broken)
+    client = TestClient(create_app(studio))
+    res = client.post("/api/uploads", params={"filename": "IMG_1.HEIC"}, content=b"x")
+    assert res.status_code == 400 and "HEIC" in res.json()["detail"].upper()
+    assert client.post("/api/uploads", params={"filename": "a.jpg"}, content=b"").status_code == 400
+    assert client.get("/api/uploads/../x/final.jpg").status_code == 404
+
+    client.post("/api/uploads", params={"filename": "a.jpg"}, content=b"\xff\xd8")
+    studio.cycle()
+    [row] = client.get("/api/uploads").json()
+    assert row["state"] == "failed" and row["error"] == "マーカーが写っていません"
+    assert studio.pending_uploads() == []

@@ -8,6 +8,7 @@ Phase 1 まで実装済み。サーバー側は、エッジからの取り込み
 
 - テストとリント: `uv sync && uv run pytest`、`uv run ruff check . && uv run ruff format .`
 - スタジオ（常駐。取り込み → 完成画像 → 撮影アプリに状態と画像を返す）: systemd のユーザーサービス `super-imx519-studio`（`deploy/super-imx519-studio.service`、`http://100.108.168.101:8520`。更新したら `systemctl --user restart super-imx519-studio`）。完成画像は `~/data/super_imx519/results/<session_id>/final.jpg`
+- iPhone カメラモード: 撮影アプリの「iPhone」タブから送った写真を、スタジオが `pipeline/phone.py` で補正する（傾き・色・マーカーとカードの除去・縦 2:3 の切り出し）。設計は DESIGN.md の「iPhone カメラモード」
 - エッジからの取り込み: `uv run python -m super_imx519.ingest`（85pi の `https://85pi.taila713c8.ts.net:12443` から `~/data/super_imx519/sessions/` へ。照合したらエッジ側を消す。`--keep` で残す）
 
 - `DESIGN.md`: 設計の判断・構成・撮影技法・検証計画・未決事項。作業の前に必ず読む
