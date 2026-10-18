@@ -197,3 +197,25 @@ def test_wall_view_with_layout_works_when_bottom_markers_are_hidden():
     a = cv2.perspectiveTransform(full.to_view(probe)[None], np.linalg.inv(full.matrix))[0]
     b = cv2.perspectiveTransform(one.to_view(probe)[None], np.linalg.inv(one.matrix))[0]
     assert np.linalg.norm(a - b) < 6  # 画素（約 3 mm）。上の 2 枚から 1 m 下まで延ばしても収まる
+
+
+def test_finish_brightens_the_wall_and_keeps_the_garment_hue():
+    from super_imx519.pipeline.finish import Finish, finish
+
+    # 灰色の壁（L* 約 78、少し黄み）に、紫の服
+    lab = np.zeros((600, 400, 3), np.float32)
+    lab[...] = (78, 1.5, 4.3)
+    lab[150:450, 100:300] = (30, 40, -60)
+    image = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    subject = np.zeros((600, 400), bool)
+    subject[150:450, 100:300] = True
+    look = Finish(sharpen=0)
+    out, report = finish(image, subject, 1.0, look)
+    after = cv2.cvtColor(out.astype(np.float32), cv2.COLOR_BGR2Lab)
+    wall = after[20:100, 20:100].reshape(-1, 3).mean(axis=0)
+    assert wall == pytest.approx([look.wall_l, *look.wall_ab], abs=0.6)
+    before = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2Lab)[300, 200]
+    garment = after[300, 200]
+    hue = lambda v: np.degrees(np.arctan2(v[2], v[1]))  # noqa: E731
+    assert abs(hue(garment) - hue(before)) < 3  # 色相はほぼそのまま
+    assert garment[0] > before[0]  # 明るさは、壁と同じカーブで少し持ち上がる

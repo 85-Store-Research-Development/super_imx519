@@ -7,7 +7,8 @@
 4. 構図: フックが上の端に掛かる縦 2:3 の枠を、壁面座標（実寸）で決める（framing.py）。服が
    はみ出すときだけ引く。較正値にフックの位置があれば、その位置を基準にする
 5. 掃除: マーカーの板とカードを、影ごと壁で埋める。切り出しが写っていない所に掛かれば、そこも埋める
-6. 長辺 2048px 以内の final.jpg（品質 95）、画面用の preview.jpg、report.json を書く
+6. 仕上げ: 背景（壁）の明るさと色味を既存の商品画像に揃え、軽くシャープにする（finish.py）
+7. 長辺 2048px 以内の final.jpg（品質 95）、画面用の preview.jpg、report.json を書く
 
 iPhone の ProRAW は、保存前に明暗の差が圧縮されている（推定）ので、色の正しさは近似にとどまる。
 """
@@ -23,12 +24,14 @@ import numpy as np
 
 from ..markers import BOARD_MM, MARKER_MM
 from . import cleanup, color, framing, rectify, stacking
+from .finish import Finish, finish
 from .process import FINAL_SIDE, PREVIEW_SIDE, fit, write_jpeg
 
 SUFFIXES = {".jpg", ".jpeg", ".png", ".dng"}
 DEFAULT_WALL = Path("~/data/super_imx519/wall.json").expanduser()  # 壁の配置の較正値
 HOOK_MOVED_MM = 30.0  # 見つけたフックが較正値からこれ以上離れていたら知らせる
 CARD_BORDER_MM = 12.0  # パッチの外側の、カードの黒い台紙の幅
+DEFAULT_LOOK = Finish()
 MAX_VIEW_SIDE = 8000  # 正面図がこれより大きくなるなら、縮尺を粗くする
 
 Progress = Callable[[float, float, str], None]
@@ -115,11 +118,20 @@ def process_upload(
     progress: Progress | None = None,
     composition: framing.Layout | None = None,
     wall_path: Path | None = DEFAULT_WALL,
+    look: Finish | None = DEFAULT_LOOK,
 ) -> dict:
+    """look が None なら仕上げ（背景の明るさと色味、シャープ）をかけない。"""
     composition = composition or framing.Layout()
     wall_layout = rectify.WallLayout.load(wall_path)
     started = time.time()
-    steps = ["読み込み", "色の補正", "傾きの補正", "服とフックを探す", "マーカーを消す", "書き出し"]
+    steps = [
+        "読み込み",
+        "色の補正",
+        "傾きの補正",
+        "服とフックを探す",
+        "マーカーを消す",
+        "仕上げと書き出し",
+    ]
     report: dict = {"source_file": src.name, "warnings": []}
     warnings = report["warnings"]
 
@@ -216,6 +228,10 @@ def process_upload(
 
     step(5)
     final = fit(wall[y0 : y0 + ch, x0 : x0 + cw] / 255, min(composition.side, FINAL_SIDE))
+    if look is not None:
+        subject = foreground[y0 : y0 + ch, x0 : x0 + cw].astype(np.float32)
+        subject = cv2.resize(subject, final.shape[1::-1], interpolation=cv2.INTER_AREA) > 0.1
+        final, report["finish"] = finish(final, subject, cw * mm / final.shape[1], look)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_jpeg(out_dir / "preview.jpg", fit(final, PREVIEW_SIDE), 85)
     report["final_size"] = [final.shape[1], final.shape[0]]
