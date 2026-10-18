@@ -121,7 +121,7 @@ def test_process_upload_makes_clean_portrait(tmp_path, garment_h_mm):
     cv2.imwrite(str(src), _photo(wall), [cv2.IMWRITE_JPEG_QUALITY, 95])
     out = tmp_path / "out"
     seen = []
-    report = process_upload(src, out, progress=lambda d, t, label: seen.append(label))
+    report = process_upload(src, out, lambda d, t, label: seen.append(label), wall_path=None)
     final = cv2.imread(str(out / "final.jpg"))
     assert final.shape[0] == 2048 and final.shape[1] / final.shape[0] == pytest.approx(
         2 / 3, abs=0.01
@@ -140,3 +140,55 @@ def test_process_upload_makes_clean_portrait(tmp_path, garment_h_mm):
         assert crop["scale"] > 1 and any("引いて" in w for w in report["warnings"])
     else:
         assert crop["scale"] == 1.0 and crop["width_mm"] == pytest.approx(900, abs=1)
+
+
+def test_fit_layout_recovers_tilted_boards_from_several_views():
+    from super_imx519.pipeline.calibrate import fit_layout
+
+    truth = {0: (0, 0, 0.8), 1: (612, -1, -0.1), 2: (-4, 1066, -1.4), 3: (617, 1074, 0.7)}
+    layout_true = rectify.WallLayout(truth)
+    rng = np.random.default_rng(3)
+    views = []
+    for _ in range(5):
+        # 壁面の mm → 画像の画素。写真ごとに位置と傾きを変える
+        src = np.float32([[-300, -300], [900, -300], [900, 1400], [-300, 1400]])
+        jitter = rng.uniform(-120, 120, (4, 2)).astype(np.float32)
+        dst = np.float32([[200, 300], [2800, 250], [2850, 3900], [150, 3950]]) + jitter
+        h = cv2.getPerspectiveTransform(src, dst)
+        views.append(
+            {
+                i: cv2.perspectiveTransform(layout_true.corners(i)[None], h)[0]
+                + rng.normal(0, 0.3, (4, 2))
+                for i in truth
+            }
+        )
+    layout, report = fit_layout(views)
+    # 向きは傾きの平均を 0 にとるので、正解も同じようにそろえて比べる
+    mean = np.mean([m[2] for m in truth.values()])
+    for i, (x, y, angle) in truth.items():
+        t = np.radians(-mean)
+        ex = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]]) @ [x, y]
+        # 角の位置の揺れ 0.3 px で、1 m 離れたマーカーが 1 mm 程度ずれる
+        assert layout.markers[i][:2] == pytest.approx(ex, abs=1.5)
+        assert layout.markers[i][2] == pytest.approx(angle - mean, abs=0.15)
+    assert all(v["mean_mm"] < 0.3 for v in report["views"])
+
+
+def test_wall_view_with_layout_works_when_bottom_markers_are_hidden():
+    wall, _ = _scene()
+    centers = {0: (0, 0), 1: (640, 0), 2: (0, 1050), 3: (640, 1050)}
+    layout = rectify.WallLayout({i: (x, y, 0.0) for i, (x, y) in centers.items()})
+    full = rectify.wall_view(cv2.cvtColor(_photo(wall), cv2.COLOR_BGR2GRAY), layout=layout)
+    assert full.layout and full.residual_mm[0] < 0.5
+    # 下の 2 枚を壁の色で塗りつぶす（ロングコートで隠れたとき）
+    hidden = wall.copy()
+    for cx, cy in ((380, 1350), (1020, 1350)):
+        x, y = round(cx / MM), round(cy / MM)
+        hidden[y - 110 : y + 110, x - 110 : x + 110] = 185
+    one = rectify.wall_view(cv2.cvtColor(_photo(hidden), cv2.COLOR_BGR2GRAY), layout=layout)
+    assert sorted(one.markers) == [0, 1]
+    # 隠れたマーカーの位置（壁面の mm）を、写真の上で正しく指せる
+    probe = np.array([centers[3]], np.float64)
+    a = cv2.perspectiveTransform(full.to_view(probe)[None], np.linalg.inv(full.matrix))[0]
+    b = cv2.perspectiveTransform(one.to_view(probe)[None], np.linalg.inv(one.matrix))[0]
+    assert np.linalg.norm(a - b) < 6  # 画素（約 3 mm）。上の 2 枚から 1 m 下まで延ばしても収まる
