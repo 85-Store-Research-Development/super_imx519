@@ -143,7 +143,8 @@ def test_process_upload_makes_clean_portrait(tmp_path, garment_h_mm):
     if garment_h_mm > 1300:
         assert crop["scale"] > 1 and any("引いて" in w for w in report["warnings"])
     else:
-        assert crop["scale"] == 1.0 and crop["width_mm"] == pytest.approx(900, abs=1)
+        assert crop["scale"] == 1.0
+        assert crop["width_mm"] == pytest.approx(framing.Layout().width_mm, abs=1)
 
 
 def test_fit_layout_recovers_tilted_boards_from_several_views():
