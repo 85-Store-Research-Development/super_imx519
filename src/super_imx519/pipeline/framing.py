@@ -1,8 +1,9 @@
 """服（とハンガー・フック）を見つけ、商品画像の構図（縦 2:3）で切り出す範囲を決める。
 
 構図は 85-store の商品画像に合わせる: 壁のフックが上の端に少し掛かり、服はフックの真下で左右の
-中央。枠は壁面座標（mm）で決まった四角で、服の大きさでは変えない。どの商品も同じ位置から同じ画角で
-撮ったように揃い、小さい服は小さく、大きい服は大きく写る（はみ出すときは知らせるだけ）。
+中央。枠は壁面座標（mm）で決まった四角で、ふだんは服の大きさでは変えない。どの商品も同じ位置から
+同じ画角で撮ったように揃い、小さい服は小さく、大きい服は大きく写る。服が枠からはみ出すとき
+（ロングコートなど）だけ、フックの位置の割合を保ったまま、収まるところまで引く。
 
 服の見つけ方: 壁を Lab の滑らかな面（2 次曲面）で当てはめ、そこからの差で前景を決める。
 服が壁に落とす影は「少し暗く、色はほぼ同じ」なので、次のどれかに当たるものだけを前景にする。
@@ -27,6 +28,7 @@ class Layout:
     width_mm: float = 900.0  # 切り出す幅（実寸）。どの商品も同じ
     aspect: float = 3 / 2  # 高さ / 幅
     hook_cut_mm: float = 40.0  # フックの上端から、上の端までを下げる量（フックが端に掛かる）
+    margin: float = 0.03  # はみ出して引くとき、服の裾の下と左右に空ける割合（高さ・幅に対して）
     side: int = 2048  # 書き出す長辺の上限
 
 
@@ -116,21 +118,40 @@ def find_hook(
 
 
 def crop_box(
-    hook: tuple[float, float], mm_per_px: float, layout: Layout
-) -> tuple[int, int, int, int]:
-    """(x0, y0, 幅, 高さ)。正面図の画素。フックを左右の中央・上の端に置いた、決まった大きさの枠。
+    hook: tuple[float, float],
+    mm_per_px: float,
+    layout: Layout,
+    garment: tuple[int, int, int, int] | None = None,
+) -> tuple[tuple[int, int, int, int], float]:
+    """((x0, y0, 幅, 高さ), 引いた倍率)。正面図の画素。画像の外に出ることもある（呼ぶ側で埋める）。
 
-    画像の外に出ることもある（呼ぶ側で埋める）。
+    フックを左右の中央・上の端に置いた、決まった大きさの枠（倍率 1）。服（garment = x0, y0, x1, y1）
+    がはみ出すときだけ、フックの位置の割合を保ったまま、裾と左右に margin を空けて収まるまで引く。
     """
     px = 1 / mm_per_px
-    w = layout.width_mm * px
-    h = w * layout.aspect
-    return (
-        int(round(hook[0] - w / 2)),
-        int(round(hook[1] + layout.hook_cut_mm * px)),
-        int(round(w)),
-        int(round(h)),
-    )
+    width = layout.width_mm * px
+    height = width * layout.aspect
+    cut = layout.hook_cut_mm * px
+
+    def box(s: float) -> tuple[int, int, int, int]:
+        w, h = width * s, height * s
+        return (
+            int(round(hook[0] - w / 2)),
+            int(round(hook[1] + cut * s)),
+            int(round(w)),
+            int(round(h)),
+        )
+
+    scale = 1.0
+    if garment is not None and overflow(box(1.0), garment):
+        gx0, _, gx1, gy1 = garment
+        # 裾: 下の端（フック + (cut + 高さ)·s）が、裾 + 余白（高さ·s·margin）より下に来る倍率
+        down = (gy1 - hook[1]) / (cut + height * (1 - layout.margin))
+        # 左右: フックから遠いほうの端 + 余白が 幅·s の半分に収まる倍率
+        reach = max(hook[0] - gx0, gx1 - hook[0])
+        side = reach / (width * (0.5 - layout.margin))
+        scale = max(1.0, down, side)
+    return box(scale), scale
 
 
 def overflow(box: tuple[int, int, int, int], garment: tuple[int, int, int, int]) -> list[str]:

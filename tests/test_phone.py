@@ -99,15 +99,22 @@ def test_card_correction_recovers_reference_colors():
     assert c.delta_e_after.mean() < 1.5 < c.delta_e_before.mean()
 
 
-def test_crop_is_fixed_by_the_wall_not_by_the_garment():
-    layout = framing.Layout(width_mm=900, hook_cut_mm=40)
+def test_crop_is_fixed_unless_the_garment_overflows():
+    layout = framing.Layout(width_mm=900, hook_cut_mm=40, margin=0.03)
     hook = (1000.0, 200.0)
-    box = framing.crop_box(hook, MM, layout)
-    assert box == (100, 280, 1800, 2700)  # フックが左右の中央、上の端から 40 mm 下
+    # 収まる服: 決まった枠（フックが左右の中央、上の端から 40 mm 下）
+    box, scale = framing.crop_box(hook, MM, layout, (800, 450, 1200, 2200))
+    assert scale == 1.0 and box == (100, 280, 1800, 2700)
     assert framing.overflow(box, (800, 450, 1200, 2200)) == []
-    # ロングコート: 引かずに、はみ出しを知らせる
-    assert framing.overflow(box, (800, 450, 1200, 3400)) == ["下"]
-    assert framing.overflow(box, (50, 450, 1950, 2200)) == ["左", "右"]
+    # ロングコート: はみ出すときだけ引く。フックの位置の割合と縦横比は同じで、裾の下に余白が残る
+    long = (800, 450, 1200, 3400)
+    assert framing.overflow(box, long) == ["下"]
+    (x0, y0, w, h), scale = framing.crop_box(hook, MM, layout, long)
+    assert scale > 1 and framing.overflow((x0, y0, w, h), long) == []
+    assert y0 + h - 3400 == pytest.approx(0.03 * h, abs=2)
+    assert x0 + w / 2 == pytest.approx(hook[0], abs=1)
+    assert (y0 - hook[1]) / h == pytest.approx(80 / 2700, rel=0.01)
+    assert w / h == pytest.approx(2 / 3, rel=0.01)
 
 
 @pytest.mark.parametrize("garment_h_mm", [900.0, 1500.0])
@@ -132,9 +139,11 @@ def test_process_upload_makes_clean_portrait(tmp_path, garment_h_mm):
     # フックは左右の中央、上の端の近く
     crop = report["crop"]
     assert crop["hook_px"][0] == pytest.approx(crop["box_px"][0] + crop["box_px"][2] / 2, abs=2)
-    assert crop["width_mm"] == pytest.approx(900, abs=1)  # 服の大きさで縮尺を変えない
-    overflowed = any("はみ出して" in w for w in report["warnings"])
-    assert overflowed == (garment_h_mm > 1300)
+    # 収まる服は決まった枠、はみ出す服だけ引く
+    if garment_h_mm > 1300:
+        assert crop["scale"] > 1 and any("引いて" in w for w in report["warnings"])
+    else:
+        assert crop["scale"] == 1.0 and crop["width_mm"] == pytest.approx(900, abs=1)
 
 
 def test_fit_layout_recovers_tilted_boards_from_several_views():

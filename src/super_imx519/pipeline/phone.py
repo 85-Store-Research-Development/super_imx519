@@ -4,8 +4,8 @@
 2. 色: カラーカードを見つけて補正する（color.py）。無ければ補正せず、report に書く
 3. 形: 4 隅のマーカーで、壁の正面図（0.5 mm/px）にする（rectify.py）。壁の配置の較正値
    （DEFAULT_WALL。calibrate.py）があれば使う
-4. 構図: フックが上の端に掛かる縦 2:3 の枠を、壁面座標（実寸）で決める（framing.py）。服の大きさ
-   では変えない。較正値にフックの位置があれば、その位置を基準にする（どの写真でも枠が同じ位置になる）
+4. 構図: フックが上の端に掛かる縦 2:3 の枠を、壁面座標（実寸）で決める（framing.py）。服が
+   はみ出すときだけ引く。較正値にフックの位置があれば、その位置を基準にする
 5. 掃除: マーカーの板とカードを、影ごと壁で埋める。切り出しが写っていない所に掛かれば、そこも埋める
 6. 長辺 2048px 以内の final.jpg（品質 95）、画面用の preview.jpg、report.json を書く
 
@@ -177,12 +177,11 @@ def process_upload(
                 f"見つけたフックが較正の位置から {moved:.0f} mm 離れています"
                 "（フックやマーカーを動かしたなら、較正し直してください）"
             )
-    x0, y0, cw, ch = framing.crop_box(hook, mm, composition)
-    sides = framing.overflow((x0, y0, cw, ch), bbox)
-    if sides:
+    (x0, y0, cw, ch), scale = framing.crop_box(hook, mm, composition, bbox)
+    if scale > 1:
         warnings.append(
-            f"服が枠（幅 {composition.width_mm:.0f} mm）の{'・'.join(sides)}からはみ出しています"
-            "（縮尺はどの商品も同じにしているので、引いては切り出しません）"
+            f"服が枠（幅 {composition.width_mm:.0f} mm）からはみ出すので、この商品だけ "
+            f"{scale:.2f} 倍に引いて切り出しました（ハンガーの位置は同じ）"
         )
     if bbox[3] >= np.nonzero(valid.any(axis=1))[0].max() - 2:
         warnings.append("服の裾が写真の下の端で切れています（下まで入るように撮ってください）")
@@ -199,6 +198,7 @@ def process_upload(
         "hook_px": [round(hook[0], 1), round(hook[1], 1)],
         "hook_from": "較正値" if wall_layout and wall_layout.hook_mm else "検出",
         "garment_px": list(bbox),
+        "scale": round(scale, 3),
         "box_px": [x0, y0, cw, ch],
         "width_mm": round(cw * mm, 1),
         "height_mm": round(ch * mm, 1),
