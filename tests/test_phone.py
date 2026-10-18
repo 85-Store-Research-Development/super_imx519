@@ -219,3 +219,13 @@ def test_finish_brightens_the_wall_and_keeps_the_garment_hue():
     hue = lambda v: np.degrees(np.arctan2(v[2], v[1]))  # noqa: E731
     assert abs(hue(garment) - hue(before)) < 3  # 色相はほぼそのまま
     assert garment[0] > before[0]  # 明るさは、壁と同じカーブで少し持ち上がる
+
+
+def test_finish_lowers_the_wall_target_for_light_garments():
+    from super_imx519.pipeline.finish import Finish, wall_target
+
+    look = Finish()
+    assert wall_target(look, 77.0, 30.0) == look.wall_l  # 暗い服: 壁は 94
+    light = wall_target(look, 77.0, 89.0)  # 明るい服: 服の濃淡を残すため、壁を下げる
+    assert look.min_wall_l <= light < look.wall_l
+    assert light + look.bright_slope * (89.0 - 77.0) <= look.bright_max + 1e-6
