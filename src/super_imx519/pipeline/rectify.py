@@ -25,11 +25,15 @@ _HALF = MARKER_MM / 2
 _SQUARE = np.array([[-_HALF, -_HALF], [_HALF, -_HALF], [_HALF, _HALF], [-_HALF, _HALF]])
 
 
+def rotation(angle_deg: float) -> np.ndarray:
+    """2 × 2 の回転行列（画像の座標では時計回り）。"""
+    t = np.radians(angle_deg)
+    return np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+
+
 def square(center: tuple[float, float], angle_deg: float = 0.0) -> np.ndarray:
     """マーカーの 4 角（壁面の mm。左上から時計回り）。angle は時計回りの傾き。"""
-    t = np.radians(angle_deg)
-    rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
-    return np.asarray(center, np.float64) + _SQUARE @ rot.T
+    return np.asarray(center, np.float64) + _SQUARE @ rotation(angle_deg).T
 
 
 @dataclass
@@ -130,9 +134,18 @@ def normalizer(pts: np.ndarray) -> np.ndarray:
     return np.array([[k, 0, -k * mean[0]], [0, k, -k * mean[1]], [0, 0, 1]])
 
 
+def to_h8(h: np.ndarray) -> np.ndarray:
+    """3 × 3 のホモグラフィを、最後の要素を 1 にそろえた先頭 8 要素にする（解くときの未知数）。"""
+    return (h / h[2, 2]).ravel()[:8]
+
+
+def from_h8(h8: np.ndarray) -> np.ndarray:
+    return np.append(h8, 1.0).reshape(3, 3)
+
+
 def project(h8: np.ndarray, q: np.ndarray) -> np.ndarray:
-    """ホモグラフィ（3 × 3 の先頭 8 要素。最後は 1）で点を写す。"""
-    h = np.append(h8, 1.0).reshape(3, 3)
+    """ホモグラフィ（to_h8 の 8 要素）で点を写す。"""
+    h = from_h8(h8)
     proj = q @ h[:, :2].T + h[:, 2]
     return proj[:, :2] / proj[:, 2:]
 
@@ -163,7 +176,7 @@ def least_squares(residual, params: np.ndarray, iterations: int = 100) -> np.nda
     return params
 
 
-def _fit(pts: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
+def fit_free(pts: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
     """画像の角（4n × 2）→ 壁面の mm のホモグラフィと、各マーカーの壁面上の角（4n × 2）。
 
     未知数はホモグラフィ（8）と、1 枚目を原点にした各マーカーの中心（2(n-1)）。交互に推定して
@@ -176,14 +189,14 @@ def _fit(pts: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
         centers = cv2.perspectiveTransform(q[None], H)[0].reshape(-1, 4, 2).mean(axis=1)
         centers -= centers[0]
         H, _ = cv2.findHomography(q, (centers[:, None, :] + _SQUARE[None]).reshape(-1, 2))
-    params = np.concatenate([(H / H[2, 2]).ravel()[:8], centers[1:].ravel()])
+    params = np.concatenate([to_h8(H), centers[1:].ravel()])
 
     def targets(p: np.ndarray) -> np.ndarray:
         c = np.vstack([[0.0, 0.0], p[8:].reshape(-1, 2)])
         return (c[:, None, :] + _SQUARE[None]).reshape(-1, 2)
 
     params = least_squares(lambda p: (project(p[:8], q) - targets(p)).ravel(), params)
-    return np.append(params[:8], 1.0).reshape(3, 3) @ norm, targets(params)
+    return from_h8(params[:8]) @ norm, targets(params)
 
 
 def wall_view(
@@ -204,7 +217,7 @@ def wall_view(
         targets = np.vstack([layout.corners(i) for i in ids])
         H, _ = cv2.findHomography(pts, targets, 0)  # 最小二乗（OpenCV が LM で詰める）
     else:
-        H, targets = _fit(pts, len(ids))
+        H, targets = fit_free(pts, len(ids))
     residual = np.linalg.norm(cv2.perspectiveTransform(pts[None], H)[0] - targets, axis=1)
 
     # 元の画像の全体が収まるように、mm → 正面図の画素を決める

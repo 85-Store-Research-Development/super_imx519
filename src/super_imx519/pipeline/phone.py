@@ -54,7 +54,7 @@ def detection_image(rgb: np.ndarray, source: str) -> tuple[np.ndarray, float]:
     return (np.clip(srgb[..., ::-1], 0, 1) * 255 + 0.5).astype(np.uint8), white
 
 
-def board_poly(quad: np.ndarray, mm_per_px: float) -> np.ndarray:
+def board_poly(quad: np.ndarray) -> np.ndarray:
     """マーカーの 4 角から、板（一辺 BOARD_MM）と縁の分の外形。"""
     center = quad.mean(axis=0)
     return center + (quad - center) * (BOARD_MM / 2 + cleanup.EDGE_MM) / (MARKER_MM / 2)
@@ -72,7 +72,6 @@ class Scene:
     """正面図で見つけたもの。座標は正面図の画素。"""
 
     polys: list[np.ndarray]  # 消す物（マーカーの板とカード）の外形
-    objects: np.ndarray  # polys を塗ったもの
     foreground: np.ndarray
     garment: np.ndarray
     hook: tuple[float, float]  # 見つけたフックの上端
@@ -96,20 +95,66 @@ def analyze(
 ) -> Scene:
     """正面図（BGR、0〜255）から、消す物・服・フックを見つける。"""
     mm = view.mm_per_px
-    polys = [board_poly(q, mm) for q in view.markers.values()]
+    polys = [board_poly(q) for q in view.markers.values()]
     if quads is not None:
         card_points = cv2.perspectiveTransform(quads.reshape(1, -1, 2), view.matrix)[0]
         polys.append(card_poly(card_points, mm))
-    objects = np.zeros(image.shape[:2], np.uint8)
+    objects = np.zeros(image.shape[:2], bool)
     for p in polys:
-        cv2.fillConvexPoly(objects, np.round(p).astype(np.int32), 1)
-    foreground = framing.foreground_mask(image, valid, exclude=objects > 0)
+        objects |= cleanup.poly_mask(image.shape, p)
+    foreground = framing.foreground_mask(image, valid, exclude=objects)
     garment = framing.garment_component(foreground)
-    edges = framing.sharp_edges(image, mm) & valid & (objects == 0)
+    edges = framing.sharp_edges(image, mm) & valid & ~objects
     hook = framing.find_hook(foreground, garment, mm, edges)
     gy, gx = np.nonzero(garment)
     bbox = (int(gx.min()), int(gy.min()), int(gx.max()), int(gy.max()))
-    return Scene(polys, objects > 0, foreground, garment, hook, bbox)
+    return Scene(polys, foreground, garment, hook, bbox)
+
+
+def correct_color(
+    rgb: np.ndarray, source: str, white: float, detect: np.ndarray, report: dict
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """カラーカードで色を合わせた BGR（0〜255、sRGB）と、カードのパッチの角（無ければ None）。"""
+    quads = color.find_card(detect)
+    if quads is not None:
+        correction = color.fit_card(color.sample_patches(rgb, quads), source)
+        linear = correction.apply(rgb.reshape(-1, 3)).reshape(rgb.shape)
+        report["color"] = correction.report()
+    else:
+        report["warnings"].append("カラーカードが見つからないため、色は補正していません")
+        linear = rgb / white if source == "linear" else color.to_linear(rgb)
+        report["color"] = None
+    return (color.to_srgb(linear)[..., ::-1] * 255).astype(np.float32), quads
+
+
+def marker_warning(found: int, wall_layout: rectify.WallLayout | None) -> str | None:
+    expected = len(wall_layout.markers) if wall_layout else 4
+    if found >= expected:
+        return None
+    if found >= 2 and wall_layout:
+        note = "較正値があるので補正はできます"
+    elif found == 1:
+        note = "離れた所ほど傾きの補正がずれます。2 枚以上写してください"
+    else:
+        note = "傾きの補正の精度が落ちます"
+    return f"マーカーが {found} 枚しか見つかりません（{note}）"
+
+
+def hook_position(
+    scene: Scene, view: rectify.WallView, wall_layout: rectify.WallLayout | None, report: dict
+) -> tuple[float, float]:
+    """構図の基準にするフックの位置（正面図の画素）。較正値があればそれ、無ければ見つけた位置。"""
+    if not (wall_layout and wall_layout.hook_mm):
+        return scene.hook
+    hook = tuple(view.to_view([wall_layout.hook_mm])[0])
+    moved = float(np.hypot(*np.subtract(scene.hook, hook))) * view.mm_per_px
+    report["hook_detected_offset_mm"] = round(moved, 1)
+    if moved > HOOK_MOVED_MM:
+        report["warnings"].append(
+            f"見つけたフックが較正の位置から {moved:.0f} mm 離れています"
+            "（フックやマーカーを動かしたなら、較正し直してください）"
+        )
+    return hook
 
 
 def process_upload(
@@ -146,31 +191,13 @@ def process_upload(
     detect, white = detection_image(rgb, source)
 
     step(1)
-    quads = color.find_card(detect)
-    if quads is not None:
-        correction = color.fit_card(color.sample_patches(rgb, quads), source)
-        linear = correction.apply(rgb.reshape(-1, 3)).reshape(rgb.shape)
-        report["color"] = correction.report()
-    else:
-        warnings.append("カラーカードが見つからないため、色は補正していません")
-        linear = rgb / white if source == "linear" else color.to_linear(rgb)
-        report["color"] = None
+    bgr, quads = correct_color(rgb, source, white, detect, report)
     del rgb
-    bgr = (color.to_srgb(linear)[..., ::-1] * 255).astype(np.float32)
-    del linear
 
     step(2)
     view, mm = make_view(detect, wall_layout)
-    expected = len(wall_layout.markers) if wall_layout else 4
-    found = len(view.markers)
-    if found < expected:
-        if found >= 2 and wall_layout:
-            note = "較正値があるので補正はできます"
-        elif found == 1:
-            note = "離れた所ほど傾きの補正がずれます。2 枚以上写してください"
-        else:
-            note = "傾きの補正の精度が落ちます"
-        warnings.append(f"マーカーが {found} 枚しか見つかりません（{note}）")
+    if note := marker_warning(len(view.markers), wall_layout):
+        warnings.append(note)
     report["wall"] = view.report()
     wall = np.clip(view.warp(bgr), 0, 255)
     valid = view.valid(bgr.shape)
@@ -179,16 +206,7 @@ def process_upload(
     step(3)
     scene = analyze(wall, valid, view, quads)
     polys, foreground, bbox = scene.polys, scene.foreground, scene.bbox
-    hook = scene.hook
-    if wall_layout and wall_layout.hook_mm:
-        hook = tuple(view.to_view([wall_layout.hook_mm])[0])
-        moved = float(np.hypot(*(np.subtract(scene.hook, hook)))) * mm
-        report["hook_detected_offset_mm"] = round(moved, 1)
-        if moved > HOOK_MOVED_MM:
-            warnings.append(
-                f"見つけたフックが較正の位置から {moved:.0f} mm 離れています"
-                "（フックやマーカーを動かしたなら、較正し直してください）"
-            )
+    hook = hook_position(scene, view, wall_layout, report)
     (x0, y0, cw, ch), scale = framing.crop_box(hook, mm, composition, bbox)
     if scale > 1:
         warnings.append(

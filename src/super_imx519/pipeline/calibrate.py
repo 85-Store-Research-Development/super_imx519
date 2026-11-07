@@ -12,7 +12,17 @@
 import cv2
 import numpy as np
 
-from .rectify import WallLayout, _fit, least_squares, normalizer, project, square
+from .rectify import (
+    WallLayout,
+    fit_free,
+    from_h8,
+    least_squares,
+    normalizer,
+    project,
+    rotation,
+    square,
+    to_h8,
+)
 
 
 def fit_layout(views: list[dict[int, np.ndarray]]) -> tuple[WallLayout, dict]:
@@ -29,32 +39,28 @@ def fit_layout(views: list[dict[int, np.ndarray]]) -> tuple[WallLayout, dict]:
     ref, others = ids[0], ids[1:]
 
     # 初期値: 写真ごとに単独で解き（傾きは 0 とみなす）、マーカーの中心を写真のあいだで平均する
-    norms, qs, h0, centers = [], [], [], {i: [] for i in ids}
+    qs, h0, centers = [], [], {i: [] for i in ids}
     for found in views:
         vid = sorted(found)
         pts = np.vstack([found[i] for i in vid])
         norm = normalizer(pts)
         q = cv2.perspectiveTransform(pts[None], norm)[0]
-        H, targets = _fit(pts, len(vid))
+        H, targets = fit_free(pts, len(vid))
         c = targets.reshape(-1, 4, 2).mean(axis=1)
         if ref in found:
             for i, center in zip(vid, c - c[vid.index(ref)], strict=True):
                 centers[i].append(center)
-        Hn = H @ np.linalg.inv(norm)
-        norms.append(norm)
         qs.append((vid, q))
-        h0.append((Hn / Hn[2, 2]).ravel()[:8])
+        h0.append(to_h8(H @ np.linalg.inv(norm)))
     init = {i: np.mean(centers[i], axis=0) if centers[i] else np.zeros(2) for i in ids}
     # 原点のマーカーが写っていない写真は、初期値で原点をずらしておく
     for v, found in enumerate(views):
         if ref not in found:
             vid = sorted(found)
-            h = np.append(h0[v], 1.0).reshape(3, 3)
             shift = np.eye(3)
             proj = project(h0[v], qs[v][1]).reshape(-1, 4, 2).mean(axis=1)
             shift[:2, 2] = init[vid[0]] - proj[0]
-            h = shift @ h
-            h0[v] = (h / h[2, 2]).ravel()[:8]
+            h0[v] = to_h8(shift @ from_h8(h0[v]))
 
     n_views = len(views)
     params = np.concatenate([np.concatenate(h0)] + [np.append(init[i], 0.0) for i in others])
@@ -79,8 +85,7 @@ def fit_layout(views: list[dict[int, np.ndarray]]) -> tuple[WallLayout, dict]:
 
     # 向き: 傾きの平均が 0 になるよう、全体を回す（原点のマーカーの中心のまわり）
     mean_angle = float(np.mean([m[2] for m in markers.values()]))
-    t = np.radians(-mean_angle)
-    rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+    rot = rotation(-mean_angle)
     markers = {
         i: (*(rot @ np.array([x, y])), angle - mean_angle) for i, (x, y, angle) in markers.items()
     }

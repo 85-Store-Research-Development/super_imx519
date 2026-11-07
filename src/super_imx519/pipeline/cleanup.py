@@ -49,7 +49,8 @@ def pull_push(values: np.ndarray, weight: np.ndarray) -> np.ndarray:
     return values * weight[..., None] + up * (1 - weight[..., None])
 
 
-def _poly_mask(shape: tuple[int, ...], poly: np.ndarray) -> np.ndarray:
+def poly_mask(shape: tuple[int, ...], poly: np.ndarray) -> np.ndarray:
+    """凸多角形（画素）の内側。"""
     mask = np.zeros(shape[:2], np.uint8)
     cv2.fillConvexPoly(mask, np.round(poly).astype(np.int32), 1)
     return mask > 0
@@ -65,12 +66,15 @@ class WallFiller:
         nonwall: np.ndarray,
         protect: np.ndarray,
         mm_per_px: float,
+        unfilled: np.ndarray | None = None,
         seed: int = 0,
     ):
+        """image は埋めるたびに書き換える。
+
+        unfilled はまだ消していない物（壁の色の手がかりにしない）。
+        """
         self.image, self.valid, self.protect = image, valid, protect
-        self.unfilled = np.zeros(
-            image.shape[:2], bool
-        )  # まだ消していない物（壁の色の推定に使わない）
+        self.unfilled = np.zeros(image.shape[:2], bool) if unfilled is None else unfilled.copy()
         self.px = 1 / mm_per_px
         h, w = image.shape[:2]
         self.yy, self.xx = np.mgrid[0:h, 0:w]
@@ -216,20 +220,15 @@ def remove_objects(
     mm_per_px: float,
 ) -> tuple[WallFiller, list[dict]]:
     """polys（板・カードの外形。正面図の画素）を影ごと消す。image は書き換える。"""
-    objects = np.zeros(image.shape[:2], bool)
-    masks = [_poly_mask(image.shape, p) for p in polys]
-    for m in masks:
-        objects |= m
+    masks = [poly_mask(image.shape, p) for p in polys]
+    empty = np.zeros(image.shape[:2], bool)
+    objects = np.logical_or.reduce([empty, *masks])
     protect = protect_mask(image, foreground, objects, mm_per_px)
     nonwall = objects | foreground | ~valid
-    filler = WallFiller(image, valid, nonwall, protect, mm_per_px)
-    filler.unfilled = objects.copy()
+    filler = WallFiller(image, valid, nonwall, protect, mm_per_px, unfilled=objects)
     report = []
     for i, mask in enumerate(masks):
-        others = np.zeros_like(objects)
-        for j, m in enumerate(masks):
-            if j != i:
-                others |= m
+        others = np.logical_or.reduce([empty, *(m for j, m in enumerate(masks) if j != i)])
         grown = filler.with_shadow(mask, others)
         n = filler.fill(grown)
         report.append({"filled_px": n, "shadow_px": int((grown & ~mask).sum())})
