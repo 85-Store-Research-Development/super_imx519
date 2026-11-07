@@ -118,15 +118,40 @@ def _luminance(lightness: np.ndarray) -> np.ndarray:
     return np.where(f > 6 / 29, f**3, 3 * (6 / 29) ** 2 * (f - 4 / 29))
 
 
+def subject_bands(
+    subject: np.ndarray, mm_per_px: float, edge_mm: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """服の内側（縁から edge_mm より内）と、服から edge_mm 以内（服を含む）。"""
+    kernel = np.ones((3, 3), np.uint8)
+    steps = max(int(edge_mm / mm_per_px), 1)
+    core = cv2.erode(subject.astype(np.uint8), kernel, iterations=steps) > 0
+    near = cv2.dilate(subject.astype(np.uint8), kernel, iterations=steps) > 0
+    return core, near
+
+
+def tint_background(
+    srgb: np.ndarray, subject: np.ndarray, mm_per_px: float, params: Finish
+) -> np.ndarray:
+    """壁の色味を wall_ab に寄せる。服の内側には寄せず、縁は色が壁に近い画素ほど強く寄せる。"""
+    core, near = subject_bands(subject, mm_per_px, params.edge_mm)
+    lab = cv2.cvtColor(srgb.astype(np.float32), cv2.COLOR_BGR2Lab)
+    wall_mid = np.median(lab[~near], axis=0)
+    shift = np.array(params.wall_ab, np.float32) - wall_mid[1:]
+    likeness = np.clip(
+        1 - np.linalg.norm(lab[..., 1:] - wall_mid[1:], axis=2) / params.wall_ab_tolerance, 0, 1
+    )
+    weight = np.where(near, likeness, 1.0).astype(np.float32)
+    weight[core] = 0
+    weight = cv2.GaussianBlur(weight, (0, 0), 1.0)
+    lab[..., 1:] += weight[..., None] * shift
+    return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+
+
 def finish(
     image: np.ndarray, subject: np.ndarray, mm_per_px: float, params: Finish
 ) -> tuple[np.ndarray, dict]:
     """image は書き出す大きさの BGR（0〜1、sRGB）、subject は服・ハンガー・フックの画素。"""
-    px = 1 / mm_per_px
-    kernel = np.ones((3, 3), np.uint8)
-    steps = max(int(params.edge_mm * px), 1)
-    core = cv2.erode(subject.astype(np.uint8), kernel, iterations=steps) > 0
-    near = cv2.dilate(subject.astype(np.uint8), kernel, iterations=steps) > 0
+    core, near = subject_bands(subject, mm_per_px, params.edge_mm)
     background = ~near
     lab = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2Lab)
     if background.sum() < 1000:
@@ -163,17 +188,7 @@ def finish(
     srgb = to_srgb(out).astype(np.float32)
 
     # 2. 背景の色味（服の内側には寄せない。縁は、色が壁に近いほど強く）
-    lab = cv2.cvtColor(srgb, cv2.COLOR_BGR2Lab)
-    wall_mid = np.median(lab[background], axis=0)
-    shift = np.array(params.wall_ab, np.float32) - wall_mid[1:]
-    likeness = np.clip(
-        1 - np.linalg.norm(lab[..., 1:] - wall_mid[1:], axis=2) / params.wall_ab_tolerance, 0, 1
-    )
-    weight = np.where(near, likeness, 1.0).astype(np.float32)
-    weight[core] = 0
-    weight = cv2.GaussianBlur(weight, (0, 0), 1.0)
-    lab[..., 1:] += weight[..., None] * shift
-    srgb = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    srgb = tint_background(srgb, subject, mm_per_px, params)
 
     # 3. シャープ（輝度だけ）
     if params.sharpen > 0:
