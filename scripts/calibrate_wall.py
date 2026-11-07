@@ -63,6 +63,14 @@ def lens_check(views: list[dict], layout: rectify.WallLayout, size: tuple[int, i
     return out
 
 
+def photo_name(path: Path) -> str:
+    """スタジオに送られた写真（uploads/<id>/original.*）は、送ったときのファイル名で記録する。"""
+    meta = path.parent / "upload.json"
+    if meta.exists():
+        return json.loads(meta.read_text()).get("filename", path.name)
+    return path.name
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("photos", type=Path, nargs="+")
@@ -75,7 +83,7 @@ def main() -> None:
         rgb, source = phone.load(path)
         detect, _ = phone.detection_image(rgb, source)
         found = rectify.detect_markers(cv2.cvtColor(detect, cv2.COLOR_BGR2GRAY))
-        print(f"{path.name}: マーカー {sorted(found)}")
+        print(f"{photo_name(path)}: マーカー {sorted(found)}")
         if len(found) >= 2:
             photos.append(path)
             views.append(found)
@@ -90,10 +98,19 @@ def main() -> None:
         scene = phone.analyze(image, view.valid(detect.shape), view, color.find_card(detect))
         hook = view.to_mm([scene.hook])[0]
         hooks.append(hook)
-        print(f"{path.name}: フックの上端 {hook.round(1)} mm（残差 {view.residual_mm[0]:.2f} mm）")
+        name = photo_name(path)
+        print(f"{name}: フックの上端 {hook.round(1)} mm（残差 {view.residual_mm[0]:.2f} mm）")
     hooks = np.array(hooks)
     layout.hook_mm = tuple(float(v) for v in np.median(hooks, axis=0))
-    report["hook_spread_mm"] = np.round(hooks.std(axis=0), 2).tolist()
+    # ばらつきは中央値からの偏差の中央値（服の首を見誤った写真が混じっても膨らまない）
+    report["hook_spread_mm"] = np.round(
+        np.median(np.abs(hooks - np.median(hooks, axis=0)), axis=0), 2
+    ).tolist()
+    report["hook_outliers"] = [
+        photo_name(p)
+        for p, h in zip(photos, hooks, strict=True)
+        if np.linalg.norm(h - np.array(layout.hook_mm)) > phone.HOOK_MOVED_MM
+    ]
 
     size = details[0][0].shape[1::-1]
     if all(d[0].shape == details[0][0].shape for d in details):
@@ -101,7 +118,7 @@ def main() -> None:
 
     layout.info = {
         "calibrated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "photos": [p.name for p in photos],
+        "photos": [photo_name(p) for p in photos],
         **report,
     }
     print(json.dumps(layout.to_json(), indent=1, ensure_ascii=False))
