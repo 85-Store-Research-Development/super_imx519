@@ -13,12 +13,13 @@
 
 import json
 from dataclasses import dataclass, field
+from functools import cache
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from ..markers import DICTIONARY, MARKER_MM
+from ..markers import BOARD_MM, DICTIONARY, MARKER_MM, MODULES, marker_modules
 
 MM_PER_PX = 0.5
 _HALF = MARKER_MM / 2
@@ -84,6 +85,7 @@ class WallView:
     residual_mm: tuple[float, float] = (0.0, 0.0)  # 平均, 最大
     mm_to_px: np.ndarray = field(default_factory=lambda: np.eye(3))  # 壁面の mm → 正面図の画素
     layout: bool = False  # 較正値を使ったか
+    located: dict[int, float] = field(default_factory=dict)  # 柄で位置を求めたマーカー → 一致度
 
     def to_view(self, points_mm: np.ndarray) -> np.ndarray:
         pts = np.asarray(points_mm, np.float64).reshape(1, -1, 2)
@@ -109,6 +111,7 @@ class WallView:
             "marker_centers_mm": {
                 str(i): [round(float(v), 1) for v in c] for i, c in sorted(centers.items())
             },
+            "located_ids": {str(i): round(v, 2) for i, v in sorted(self.located.items())},
             "residual_mm": [round(v, 2) for v in self.residual_mm],
             "mm_per_px": self.mm_per_px,
             "layout": self.layout,
@@ -199,6 +202,62 @@ def fit_free(pts: np.ndarray, n: int) -> tuple[np.ndarray, np.ndarray]:
     return from_h8(params[:8]) @ norm, targets(params)
 
 
+LOCATE_MM_PER_PX = 0.5
+LOCATE_MARGIN_MM = 15.0  # 板の周りの壁も柄に含める
+LOCATE_MIN_SCORE = 0.35  # これより合わなければ使わない（板がほとんど隠れているなど）
+LOCATE_MIN_CONTRAST = 0.15  # 合った所で、板の白と印刷の黒の明るさの差がこれ未満なら使わない
+
+
+@cache
+def board_template(marker_id: int) -> np.ndarray:
+    """板（白）とマーカーの柄（黒）、周りの壁（灰）を描いた画像（LOCATE_MM_PER_PX）。中心が板の中心。"""
+    k = 1 / LOCATE_MM_PER_PX
+    size = int(round((BOARD_MM + 2 * LOCATE_MARGIN_MM) * k))
+    t = np.full((size, size), 0.75, np.float32)
+    c, b = size / 2, BOARD_MM / 2 * k
+    t[int(c - b) : int(c + b), int(c - b) : int(c + b)] = 1.0
+    m, o = MARKER_MM / MODULES * k, c - MARKER_MM / 2 * k
+    for r, q in zip(*np.nonzero(marker_modules(marker_id)), strict=True):
+        t[int(o + r * m) : int(o + (r + 1) * m), int(o + q * m) : int(o + (q + 1) * m)] = 0.1
+    t.flags.writeable = False
+    return t
+
+
+def locate_board(
+    gray: np.ndarray, to_mm: np.ndarray, layout: WallLayout, marker_id: int, search_mm: float
+) -> tuple[np.ndarray, float]:
+    """較正の位置から search_mm 以内で、板の柄が最もよく合う位置。
+
+    gray は元の画像（0〜1）、to_mm は元の画像の画素 → 壁面の mm のホモグラフィ。戻り値は、壁面の mm
+    での較正の位置からのずれ（x, y）と一致度（正規化相互相関）。
+    """
+    x, y, angle = layout.markers[marker_id]
+    half = BOARD_MM / 2 + LOCATE_MARGIN_MM + search_mm
+    n = int(round(2 * half / LOCATE_MM_PER_PX))
+    rot = rotation(angle)
+    steps = np.arange(n) * LOCATE_MM_PER_PX - half
+    grid = np.stack(np.meshgrid(steps, steps), -1).reshape(-1, 2) @ rot.T + [x, y]
+    px = cv2.perspectiveTransform(grid[None], np.linalg.inv(to_mm))[0].reshape(n, n, 2)
+    patch = cv2.remap(gray, px[..., 0].astype(np.float32), px[..., 1].astype(np.float32),
+                      cv2.INTER_LINEAR)  # fmt: skip
+    res = cv2.matchTemplate(patch, board_template(marker_id), cv2.TM_CCOEFF_NORMED)
+    _, score, _, (bx, by) = cv2.minMaxLoc(res)
+
+    def subpixel(v: np.ndarray, k: int) -> float:
+        if 0 < k < len(v) - 1 and (d := v[k - 1] - 2 * v[k] + v[k + 1]) != 0:
+            return k + 0.5 * (v[k - 1] - v[k + 1]) / d
+        return float(k)
+
+    # 平らな所に偶然合うことがあるので、板の白と黒の差が実際に見えているかを確かめる
+    template = board_template(marker_id)
+    seen = patch[by : by + template.shape[0], bx : bx + template.shape[1]]
+    paper, ink = seen[template == 1.0], seen[template < 0.5]
+    if np.percentile(paper, 75) - np.percentile(ink, 25) < LOCATE_MIN_CONTRAST:
+        score = 0.0
+    shift = np.array([subpixel(res[by], bx), subpixel(res[:, bx], by)]) * LOCATE_MM_PER_PX
+    return (shift - search_mm) @ rot.T, float(score)
+
+
 def wall_view(
     gray: np.ndarray, mm_per_px: float = MM_PER_PX, layout: WallLayout | None = None
 ) -> WallView:
@@ -213,9 +272,29 @@ def wall_view(
     ids = sorted(found)
     pts = np.vstack([found[i] for i in ids])
 
+    located: dict[int, float] = {}
     if layout is not None:
         targets = np.vstack([layout.corners(i) for i in ids])
         H, _ = cv2.findHomography(pts, targets, 0)  # 最小二乗（OpenCV が LM で詰める）
+        missing = sorted(set(layout.markers) - set(ids))
+        if missing:  # 隠れたマーカーを柄で探し、ホモグラフィに加える（2 回目で詰める）
+            g = gray.astype(np.float32) / 255
+            for search_mm in (50.0, 10.0):
+                extra_px, extra_mm = [], []
+                for i in missing:
+                    offset, score = locate_board(g, H, layout, i, search_mm)
+                    if score < LOCATE_MIN_SCORE:
+                        located.pop(i, None)
+                        continue
+                    located[i] = score
+                    corners = layout.corners(i)
+                    extra_px.append(cv2.perspectiveTransform((corners + offset)[None],
+                                                             np.linalg.inv(H))[0])  # fmt: skip
+                    extra_mm.append(corners)
+                if not extra_px:
+                    break
+                H, _ = cv2.findHomography(np.vstack([pts, *extra_px]),
+                                          np.vstack([targets, *extra_mm]), 0)  # fmt: skip
     else:
         H, targets = fit_free(pts, len(ids))
     residual = np.linalg.norm(cv2.perspectiveTransform(pts[None], H)[0] - targets, axis=1)
@@ -239,4 +318,5 @@ def wall_view(
         (float(residual.mean()), float(residual.max())),
         to_px,
         layout is not None,
+        located,
     )

@@ -199,6 +199,38 @@ def test_wall_view_with_layout_works_when_bottom_markers_are_hidden():
     assert np.linalg.norm(a - b) < 6  # 画素（約 3 mm）。上の 2 枚から 1 m 下まで延ばしても収まる
 
 
+def test_boards_partly_covered_by_the_hem_are_located_and_erased(tmp_path):
+    """裾が下の 2 枚の板に掛かっていても、柄で位置を求め、見えている所だけを消す。"""
+    wall, _ = _scene()
+    navy = (90, 40, 30)
+    legs_mm = [(300, 1100, 1100, 1160), (300, 1160, 450, 1330), (950, 1160, 1100, 1330)]
+    for x0, y0, x1, y1 in legs_mm:  # 服とつながった紺の脚。板の上の 3 割を覆う
+        cv2.rectangle(wall, (round(x0 / MM), round(y0 / MM)), (round(x1 / MM), round(y1 / MM)),
+                      navy, -1)  # fmt: skip
+    layout = rectify.WallLayout(
+        {0: (0, 0, 0.0), 1: (640, 0, 0.0), 2: (0, 1050, 0.0), 3: (640, 1050, 0.0)},
+        hook_mm=(320.0, -150.0),
+    )
+    layout.save(tmp_path / "wall.json")
+    src = tmp_path / "photo.jpg"
+    cv2.imwrite(str(src), _photo(wall), [cv2.IMWRITE_JPEG_QUALITY, 95])
+    report = process_upload(src, tmp_path / "out", wall_path=tmp_path / "wall.json", look=None)
+    assert sorted(report["wall"]["marker_ids"]) == [0, 1]
+    assert sorted(report["wall"]["located_ids"]) == ["2", "3"]
+    assert not any("マーカーが" in w for w in report["warnings"])
+    final = cv2.imread(str(tmp_path / "out" / "final.jpg")).astype(int)
+    b, r = final[..., 0], final[..., 2]
+    kept = ((b - r) > 40) & (r < 70)  # 紺
+    # 印刷の黒（無彩色の暗い所）。服の色の境目の混ざりは除く
+    near_cloth = cv2.dilate(kept.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    ink = (final.max(axis=2) < 80) & (np.abs(b - r) < 20) & ~near_cloth
+    assert ink.sum() < 30
+    # 紺の脚（板に掛かった所も）は残る
+    px_per_mm = final.shape[0] / report["crop"]["height_mm"]
+    expected = sum((x1 - x0) * (y1 - y0) for x0, y0, x1, y1 in legs_mm) * px_per_mm**2
+    assert kept.sum() > 0.95 * expected
+
+
 def test_finish_brightens_the_wall_and_keeps_the_garment_hue():
     from super_imx519.pipeline.finish import Finish, finish
 

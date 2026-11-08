@@ -95,7 +95,9 @@ def main() -> None:
     for path, (detect, _) in zip(photos, details, strict=True):
         view, _ = phone.make_view(detect, layout)
         image = np.clip(view.warp(detect.astype(np.float32)), 0, 255)
-        scene = phone.analyze(image, view.valid(detect.shape), view, color.find_card(detect))
+        scene = phone.analyze(
+            image, view.valid(detect.shape), view, color.find_card(detect), layout
+        )
         hook = view.to_mm([scene.hook])[0]
         hooks.append(hook)
         name = photo_name(path)

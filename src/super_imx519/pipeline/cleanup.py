@@ -27,7 +27,7 @@ BLOCK, OVERLAP = 96, 32  # 質感を借りるブロックの一辺と重なり�
 KERNEL = np.ones((3, 3), np.uint8)
 
 
-def _dilate(mask: np.ndarray, px: float) -> np.ndarray:
+def dilate(mask: np.ndarray, px: float) -> np.ndarray:
     return cv2.dilate(mask.astype(np.uint8), KERNEL, iterations=max(int(px), 1)) > 0
 
 
@@ -80,12 +80,12 @@ class WallFiller:
         self.yy, self.xx = np.mgrid[0:h, 0:w]
         self.gray = cv2.GaussianBlur(image.mean(axis=2), (0, 0), 4)
         # 質感 = 壁の画素だけでぼかした面との差（壁でない所がぼかしに混ざって偏らないように）
-        wall = (~_dilate(nonwall, 6)).astype(np.float32)
+        wall = (~dilate(nonwall, 6)).astype(np.float32)
         base = cv2.GaussianBlur(image * wall[..., None], (0, 0), SIGMA)
         base /= np.maximum(cv2.GaussianBlur(wall, (0, 0), SIGMA), 1e-3)[..., None]
         self.texture = image - base
         # 質感を借りてよいブロック: 壁でない所から十分に離れ、強い縁の無い所
-        blocked = _dilate(nonwall, 2 * SIGMA) | (np.abs(self.texture).max(axis=2) > 20)
+        blocked = dilate(nonwall, 2 * SIGMA) | (np.abs(self.texture).max(axis=2) > 20)
         integral = cv2.integral((~blocked).astype(np.uint8))
         by, bx = np.mgrid[0 : h - BLOCK : 16, 0 : w - BLOCK : 16]
         inside = (
@@ -107,7 +107,7 @@ class WallFiller:
         帯が片側しか無いと 2 次曲面は外へ伸ばしたときに暴れるので、当てはめた値が帯の色の範囲を
         超えるなら、1 次の面、平均の色の順に単純にする。
         """
-        ring = _dilate(mask, RING_MM[1] * self.px) & ~_dilate(mask, RING_MM[0] * self.px)
+        ring = dilate(mask, RING_MM[1] * self.px) & ~dilate(mask, RING_MM[0] * self.px)
         ring &= self.valid & ~self.protect & ~self.unfilled
         ring_px = self.image[ring]
         if len(ring_px) < 50:
@@ -159,7 +159,7 @@ class WallFiller:
 
     def fill(self, mask: np.ndarray, keep_protected: bool = True) -> int:
         """mask を埋める。埋めた画素数を返す。"""
-        inner = _dilate(mask, RING_MM[0] * self.px)
+        inner = dilate(mask, RING_MM[0] * self.px)
         if keep_protected:
             inner &= mask | ~self.protect
         fy, fx = np.nonzero(inner)
@@ -184,7 +184,7 @@ class WallFiller:
 
     def with_shadow(self, mask: np.ndarray, others: np.ndarray) -> np.ndarray:
         """mask に、つながっている影を足す。"""
-        near = _dilate(mask, SHADOW_MM * self.px) & self.valid & ~self.protect & ~others
+        near = dilate(mask, SHADOW_MM * self.px) & self.valid & ~self.protect & ~others
         for _ in range(2):
             fy, fx, fit = self.fit(mask, near)
             diff = self.gray[fy, fx] - fit.mean(axis=1)
@@ -208,19 +208,18 @@ def protect_mask(
     服・ハンガー・フックとその周りと、輪郭のくっきりした物（消す物そのものは除く）。
     """
     px = 1 / mm_per_px
-    edges = sharp_edges(image, mm_per_px) & ~_dilate(objects, 8)
-    return _dilate(foreground & ~objects, PROTECT_MM * px) | _dilate(edges, 3 * px)
+    edges = sharp_edges(image, mm_per_px) & ~dilate(objects, 8)
+    return dilate(foreground & ~objects, PROTECT_MM * px) | dilate(edges, 3 * px)
 
 
 def remove_objects(
     image: np.ndarray,
-    polys: list[np.ndarray],
+    masks: list[np.ndarray],
     valid: np.ndarray,
     foreground: np.ndarray,
     mm_per_px: float,
 ) -> tuple[WallFiller, list[dict]]:
-    """polys（板・カードの外形。正面図の画素）を影ごと消す。image は書き換える。"""
-    masks = [poly_mask(image.shape, p) for p in polys]
+    """masks（板・カードの画素。正面図）を影ごと消す。image は書き換える。"""
     empty = np.zeros(image.shape[:2], bool)
     objects = np.logical_or.reduce([empty, *masks])
     protect = protect_mask(image, foreground, objects, mm_per_px)
