@@ -4,6 +4,11 @@
 服の色は、カードで合わせた実物の色からなるべく動かさない（決定。2026-10-18。DESIGN.md
 「iPhone カメラモード」）。
 
+0. 背景のむら（シェーディング補正。2026-11-09）: 照明ムラ（光源からの距離による明暗の傾き、窓の光
+   による色の傾き）と周辺減光で、背景が場所ごとに明るさも色もむらになった。壁（服とその影から
+   flatten_exclude_mm より離れた所）のリニアな RGB の対数に、チャネルごとに滑らかな面（3 次の
+   多項式）を当て、画像全体をその面で割って平らにする。服も同じ光を受けているので同じ割合で割る
+   （服の明暗の傾きも取れる）。割る倍率は flatten_max_gain の範囲に収める
 1. 明るさとレベル補正: 輝度だけにトーンカーブをかけ、RGB の比を保つ（色相を変えない）。収まらない
    色は、同じ輝度の灰色に寄せて収める
    - 壁の明るさ（L*）を wall_l にする。壁より明るいところは 100 に向けて丸める
@@ -50,6 +55,10 @@ class Finish:
     wall_ab_tolerance: float = 8.0  # 壁の色との差（Δa*b*）がこれ以上なら、壁ではないとみなす
     sharpen: float = 0.35  # アンシャープマスクの強さ
     sharpen_sigma: float = 1.0
+    flatten: bool = True  # 背景のむらを平らにする（シェーディング補正）
+    flatten_degree: int = 3
+    flatten_exclude_mm: float = 40.0  # 服からこれ以内は、服の影が落ちるので面の当てはめに使わない
+    flatten_max_gain: float = 1.6  # 割る倍率の上限（と下限 1 / これ）
 
 
 def _pchip(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -147,15 +156,59 @@ def tint_background(
     return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
 
 
+def _poly_terms(u: np.ndarray, v: np.ndarray, degree: int) -> np.ndarray:
+    return np.stack([u**i * v**j for i in range(degree + 1) for j in range(degree + 1 - i)], -1)
+
+
+def flatten_background(
+    image: np.ndarray, subject: np.ndarray, mm_per_px: float, params: Finish
+) -> tuple[np.ndarray, dict]:
+    """背景のむら（照明ムラ・周辺減光・色の傾き）を、壁に当てた滑らかな面で割って平らにする。"""
+    h, w = image.shape[:2]
+    exclude = cv2.dilate(
+        subject.astype(np.uint8), np.ones((3, 3), np.uint8),
+        iterations=max(int(params.flatten_exclude_mm / mm_per_px), 1),
+    ) > 0  # fmt: skip
+    step = max(min(h, w) // 200, 1)
+    ys, xs = np.mgrid[0:h:step, 0:w:step]
+    use = ~exclude[ys, xs]
+    if use.sum() < 500:
+        return image, {"skipped": "壁が少なすぎます"}
+    linear = to_linear(np.clip(image, 0, 1)).astype(np.float32)
+    small = cv2.resize(linear, (xs.shape[1], xs.shape[0]), interpolation=cv2.INTER_AREA)
+    logs = np.log(np.maximum(small[use], 1e-4))
+    terms = _poly_terms(xs[use] / w - 0.5, ys[use] / h - 0.5, params.flatten_degree)
+    keep = np.ones(len(logs), bool)
+    for _ in range(3):  # 外れ（フックの影・汚れなど）を除いて当て直す
+        coef, *_ = np.linalg.lstsq(terms[keep], logs[keep], rcond=None)
+        resid = np.abs(terms @ coef - logs).max(axis=1)
+        keep = resid < max(3 * np.median(resid[keep]), 0.02)
+    grid_y, grid_x = np.mgrid[0:h:step, 0:w:step]
+    model = _poly_terms(grid_x / w - 0.5, grid_y / h - 0.5, params.flatten_degree) @ coef
+    level = np.median(logs[keep], axis=0)
+    gain = np.exp(np.clip(level - model, -np.log(params.flatten_max_gain),
+                          np.log(params.flatten_max_gain))).astype(np.float32)  # fmt: skip
+    gain = cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR)
+    out = to_srgb(linear * gain).astype(np.float32)
+    lum = model @ np.array([0.0722, 0.7152, 0.2126])  # BGR の順（対数の重み付けで近似）
+    return out, {
+        "light_range": round(float(np.exp(lum.max() - lum.min())), 3),
+        "wall_fit_px": int(keep.sum()),
+    }
+
+
 def finish(
     image: np.ndarray, subject: np.ndarray, mm_per_px: float, params: Finish
 ) -> tuple[np.ndarray, dict]:
     """image は書き出す大きさの BGR（0〜1、sRGB）、subject は服・ハンガー・フックの画素。"""
     core, near = subject_bands(subject, mm_per_px, params.edge_mm)
     background = ~near
-    lab = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2Lab)
     if background.sum() < 1000:
         return image, {"skipped": "背景が少なすぎます"}
+    flat = None
+    if params.flatten:  # 0. 背景のむら
+        image, flat = flatten_background(image, subject, mm_per_px, params)
+    lab = cv2.cvtColor(image.astype(np.float32), cv2.COLOR_BGR2Lab)
     wall_before = np.median(lab[background], axis=0)
 
     # 1. 明るさとレベル補正（輝度にだけカーブをかけ、RGB の比を保つ）
@@ -211,5 +264,6 @@ def finish(
         "garment_bright_l": round(bright_in, 1),
         "wall_target_l": round(target, 1),
         "out_of_gamut_px": int(over.sum()),
+        "flatten": flat,
     }
     return srgb, report

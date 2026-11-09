@@ -261,3 +261,32 @@ def test_finish_lowers_the_wall_target_for_light_garments():
     light = wall_target(look, 77.0, 89.0)  # 明るい服: 服の濃淡を残すため、壁を下げる
     assert look.min_wall_l <= light < look.wall_l
     assert light + look.bright_slope * (89.0 - 77.0) <= look.bright_max + 1e-6
+
+
+def test_finish_flattens_uneven_lighting_and_color_on_the_wall():
+    """左が暗く黄色い壁（照明ムラ）を平らにし、服にも同じ割合をかける。"""
+    from super_imx519.pipeline.color import to_linear, to_srgb
+    from super_imx519.pipeline.finish import Finish, finish
+
+    h, w = 900, 600
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    light = 0.55 + 0.35 * xx / w  # 左ほど暗い
+    tint = np.stack([1 - 0.15 * (1 - xx / w), np.ones_like(xx), np.ones_like(xx)], -1)  # 左ほど黄色
+    albedo = np.full((h, w, 3), 0.8, np.float32)
+    subject = np.zeros((h, w), bool)
+    subject[250:700, 150:450] = True
+    albedo[subject] = (0.05, 0.1, 0.3)  # BGR。茶色っぽい服
+    image = to_srgb(albedo * light[..., None] * tint).astype(np.float32)
+    out, report = finish(image, subject, 1.0, Finish(sharpen=0))
+    lab = cv2.cvtColor(out.astype(np.float32), cv2.COLOR_BGR2Lab)
+    wall = ~cv2.dilate(subject.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=50).astype(
+        bool
+    )
+    left, right = wall & (xx < 100), wall & (xx > 500)
+    assert abs(lab[left].mean(0)[0] - lab[right].mean(0)[0]) < 1.0
+    assert abs(lab[left].mean(0)[2] - lab[right].mean(0)[2]) < 1.0
+    # 服も左右で同じ色になる（同じ光を受けているので）
+    g = to_linear(out)[subject]
+    gx = np.nonzero(subject)[1]
+    assert np.abs(g[gx < 200].mean(0) / g[gx > 400].mean(0) - 1).max() < 0.03
+    assert report["flatten"]["light_range"] > 1.4
