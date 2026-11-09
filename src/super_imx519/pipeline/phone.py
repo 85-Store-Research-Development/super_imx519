@@ -31,6 +31,9 @@ SUFFIXES = {".jpg", ".jpeg", ".png", ".dng"}
 DEFAULT_WALL = Path("~/data/super_imx519/wall.json").expanduser()  # 壁の配置の較正値
 HOOK_MOVED_MM = 30.0  # 見つけたフックが較正値からこれ以上離れていたら知らせる
 CARD_BORDER_MM = 12.0  # パッチの外側の、カードの黒い台紙の幅
+# 板の外側に消す幅。板は厚さ約 5 mm で、側面とその影が細い線で残った（12 mm では、中心から 63 mm
+# の所に線が残った。2026-11-09）
+BOARD_EDGE_MM = 20.0
 DEFAULT_LOOK = Finish()
 MAX_VIEW_SIDE = 8000  # 正面図がこれより大きくなるなら、縮尺を粗くする
 
@@ -57,7 +60,7 @@ def detection_image(rgb: np.ndarray, source: str) -> tuple[np.ndarray, float]:
 def board_poly(quad: np.ndarray) -> np.ndarray:
     """マーカーの 4 角から、板（一辺 BOARD_MM）と縁の分の外形。"""
     center = quad.mean(axis=0)
-    return center + (quad - center) * (BOARD_MM / 2 + cleanup.EDGE_MM) / (MARKER_MM / 2)
+    return center + (quad - center) * (BOARD_MM / 2 + BOARD_EDGE_MM) / (MARKER_MM / 2)
 
 
 def card_poly(points: np.ndarray, mm_per_px: float) -> np.ndarray:
@@ -177,10 +180,11 @@ def covered_part(
     vote = np.where(to_cloth < to_board, -1.0, 1.0)
     evidence = np.zeros(region.shape, np.float32)  # +1 見えている、-1 隠れている、0 分からない
     evidence[ys[decisive], xs[decisive]] = vote[decisive]
+    # 「隠れている」の細かい誤り（ノイズ・映り込み）を除く。「見えている」は除かない（服の脇に細く
+    # 見えている板の白が消えて、服の側に数えられ、消し残しになった）
     kernel = np.ones((5, 5), np.uint8)
-    for sign in (-1, 1):  # 細かい誤り（ノイズ・映り込み）を除く
-        keep = cv2.morphologyEx((evidence == sign).astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
-        evidence[(evidence == sign) & ~keep] = 0
+    keep = cv2.morphologyEx((evidence < 0).astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+    evidence[(evidence < 0) & ~keep] = 0
     evidence[near_garment] = -1
     evidence[ring & ~garment] = 1
     y0, y1 = max(ys.min() - 40, 0), ys.max() + 41
