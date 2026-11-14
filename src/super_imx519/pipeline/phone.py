@@ -22,7 +22,6 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .. import dataset
 from ..markers import BOARD_MM, MARKER_MM, MODULES, marker_modules
 from . import cleanup, color, framing, measure, rectify, stacking
 from .finish import Finish, finish
@@ -298,13 +297,8 @@ def process_upload(
     composition: framing.Layout | None = None,
     wall_path: Path | None = DEFAULT_WALL,
     look: Finish | None = DEFAULT_LOOK,
-    dataset_dir: Path | None = None,
-    dataset_extra: dict | None = None,
 ) -> dict:
-    """look が None なら仕上げ（背景の明るさと色味、シャープ）をかけない。
-
-    dataset_dir を渡すと、採寸のモデル用に、壁の正面図・服の形・座標の情報も残す（dataset.py）。
-    """
+    """look が None なら仕上げ（背景の明るさと色味、シャープ）をかけない。"""
     composition = composition or framing.Layout()
     wall_layout = rectify.WallLayout.load(wall_path)
     started = time.time()
@@ -352,25 +346,6 @@ def process_upload(
     except Exception as e:  # noqa: BLE001
         report["measurements"] = None
         warnings.append(f"採寸できませんでした: {e}")
-    if dataset_dir is not None:  # マーカーの板を消す前の正面図を残す
-        try:
-            dataset.save_scene(
-                dataset_dir,
-                wall,
-                scene.garment,
-                view,
-                hook,
-                bbox,
-                {
-                    **(dataset_extra or {}),
-                    "source_file": src.name,
-                    "measurements": report["measurements"],
-                    "color": report.get("color"),
-                    "warnings": list(warnings),
-                },
-            )
-        except Exception as e:  # noqa: BLE001 データセットが残せなくても商品画像は作る
-            warnings.append(f"データセットを残せませんでした: {e}")
     (x0, y0, cw, ch), scale = framing.crop_box(hook, mm, composition, bbox)
     if scale > 1:
         warnings.append(
