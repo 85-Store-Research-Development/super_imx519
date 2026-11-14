@@ -140,14 +140,14 @@ def process_source(cms: Cms, doc: dict, reference: dict | None, work: Path) -> d
         try:
             report = phone.process_upload(src, out)
         except Exception as e:  # noqa: BLE001 マーカーが見つからないなど。形は直さず、色だけ合わせる
-            report = closeup.process_closeup(src, out, reference)
+            report = closeup.process_closeup(src, out, reference, doc.get("label"))
             report["warnings"].insert(
                 0, f"壁のマーカーで整えられなかったので、色だけ合わせました: {e}"
             )
         if src.suffix.lower() == ".dng":
             report["exposure_scale"] = exposure.exposure_scale(src)
     else:
-        report = closeup.process_closeup(src, out, reference)
+        report = closeup.process_closeup(src, out, reference, doc.get("label"))
     cms.result(doc["id"], out / "final.jpg", report)
     src.unlink(missing_ok=True)
     return report

@@ -48,9 +48,9 @@ def test_closeup_correct_scales_and_applies_reference():
         "matrix": np.eye(3).tolist(),
         "exposure_scale": 1.0,
     }
-    rgb = np.full((2, 2, 3), 0.1, np.float32)
+    rgb = np.full((2, 2, 3), 0.8, np.float32)
     out = closeup.correct(rgb, 4.0, reference)  # 4 倍の露出で撮った → 1/4 にしてから倍率 2
-    assert np.allclose(out, 0.05)
+    assert np.allclose(out, 0.4)
 
 
 def test_reference_from_needs_linear_card_and_exposure():
@@ -128,7 +128,7 @@ def _fake_processing(monkeypatch, calls):
             "warnings": [],
         }
 
-    def close(src, out, reference):
+    def close(src, out, reference, label=None):
         calls.append(("closeup", src.name, bool(reference)))
         out.mkdir(parents=True, exist_ok=True)
         (out / "final.jpg").write_bytes(b"j")
@@ -195,10 +195,22 @@ def test_failure_is_reported_to_the_cms(monkeypatch):
     calls = []
     _fake_processing(monkeypatch, calls)
 
-    def broken(src, out, reference):
+    def broken(src, out, reference, label=None):
         raise ValueError("読めません")
 
     monkeypatch.setattr(cms.closeup, "process_closeup", broken)
     fake = FakeCms([_doc(3, "develop", "detail")])
     assert cms.run_once(fake, log=lambda s: None) == 0
     assert "読めません" in fake.errors[3]
+
+
+def test_dark_closeups_are_lifted_but_not_brighter_than_auto():
+    dark = np.full((10, 10, 3), 0.01, np.float32)
+    # タグは自動の 1 段下まで、生地などは 2 段下まで持ち上げる
+    assert abs(closeup.brightness_factor(dark, 1.0) * 0.01 - closeup.AUTO_BRIGHT / 2) < 1e-6
+    assert abs(closeup.brightness_factor(dark, 2.0) * 0.01 - closeup.AUTO_BRIGHT / 4) < 1e-6
+    # 明るすぎるものは自動の明るさまで下げ、その間は変えない
+    assert (
+        closeup.brightness_factor(np.full((4, 4, 3), 2.0, np.float32)) == closeup.AUTO_BRIGHT / 2.0
+    )
+    assert closeup.brightness_factor(np.full((4, 4, 3), 0.5, np.float32)) == 1.0
