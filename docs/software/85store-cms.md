@@ -65,6 +65,25 @@
 - スタッフ（`autogroup:member`）は ACL で `tag:cms` の 443 番にしか入れない（リポジトリの README の ACL の例）
 - CMS から外の内部 API を呼ぶときは `X-Internal-Token` を付ける（85crm: `CRM_INTERNAL_URL` / `CRM_INTERNAL_TOKEN`、rocm_opencv_server: `IMAGE_SERVER_URL` / `IMAGE_SERVER_TOKEN`）
 
+## 撮影の元データを補正して返す（`src/super_imx519/cms.py`）
+
+CMS の「写真から下書きを作る」で何着分かの写真をまとめて上げ、Clef（rocm_opencv_server）に商品ごとに分けてもらい、
+「下書きを作る」を押すと、商品ごとに保留の下書きができ、RAW の写真は「処理待ち」になる。
+作り方（`recipe`）は、正面・背面の RAW が `wall`、ほかの RAW が `develop`（JPEG は CMS が縮めるだけで、ここには来ない）。
+
+- `deploy/super-imx519-cms.{service,timer}` が 1 分ごとに `GET /api/photoSources/queue` を見て、商品ごとに処理する
+  （`POST /:id/claim` → 元データの URL から RAW を取る → `POST /:id/result` に仕上がりの JPEG と report。失敗は `/:id/error`）
+- 正面・背面（wall）: iPhone カメラモードと同じ処理（`pipeline/phone.py`。カラーカードで色・4 隅のマーカーで形・
+  構図・マーカーの消し込み・仕上げ）。report に露出（`exposure_scale`）と着丈・身幅（`measurements`。おおよそ）も入れる
+- アップ（develop）: 同じ商品の正面（無ければ背面）のカードの補正を、露出をそろえてから当て、正面と同じ仕上げの
+  明るさのカーブもかける（`pipeline/closeup.py`・`pipeline/exposure.py`）。正面がほかで処理中なら、その回は待つ。
+  カードの補正が無ければ、その写真だけで明るさを合わせる（report の warnings に書く）
+- 露出: DNG の露出時間・ISO・F 値と BaselineExposure から明るさの比を出す。iPhone の ProRAW の値は
+  BaselineExposure の分だけ持ち上げてあるので、`2^-BaselineExposure` を掛ける（2026-11-14、同じ服の 6 枚で確かめた）
+- 採寸（`pipeline/measure.py`）: 吊るした服を正面から撮った形で測るので、着丈は長め・身幅は袖の分だけ広め。
+  肩幅・袖丈は形だけでは決められないので測らない。手で測った値と比べて `OFFSET_CM` を入れるまで、CMS は
+  report に残すだけで採寸の欄には入れない
+
 ## 選択肢になる既存の値（2026-10-09、REST で取得）
 
 - 商品 433 件（区分: used 356 / new 77。状態: active 297 / archived 92 / draft 44）
