@@ -115,6 +115,10 @@ class WallView:
             "residual_mm": [round(v, 2) for v in self.residual_mm],
             "mm_per_px": self.mm_per_px,
             "layout": self.layout,
+            # 正面図を作り直すための変換（学習用。元の写真の画素・壁面の mm → 正面図の画素）
+            "size": [int(v) for v in self.size],
+            "matrix": np.round(self.matrix, 8).tolist(),
+            "mm_to_px": np.round(self.mm_to_px, 8).tolist(),
         }
 
 
