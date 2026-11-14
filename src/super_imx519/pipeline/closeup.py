@@ -34,7 +34,9 @@ def reference_from(report: dict, scale: float | None) -> dict | None:
     return ref
 
 
-def correct(rgb: np.ndarray, scale: float | None, reference: dict | None) -> np.ndarray:
+def correct(
+    rgb: np.ndarray, scale: float | None, reference: dict | None, floor_stops: float = 2.0
+) -> np.ndarray:
     """リニアな RGB（0〜1。DNG を現像したもの）→ 補正したリニアな sRGB。"""
     ref_scale = reference.get("exposure_scale") if reference else None
     correction = color.CardCorrection(
@@ -46,10 +48,32 @@ def correct(rgb: np.ndarray, scale: float | None, reference: dict | None) -> np.
         np.zeros(24),
     )
     values = rgb * (ref_scale / scale)
-    return correction.apply(values.reshape(-1, 3)).reshape(rgb.shape)
+    out = correction.apply(values.reshape(-1, 3)).reshape(rgb.shape)
+    return out * brightness_factor(out, floor_stops)
 
 
-def process_closeup(src: Path, out_dir: Path, reference: dict | None = None) -> dict:
+# 明るさの決め方: 正面と同じ露出（実際の明るさ）を基本にするが、襟の奥のタグのように影になった所は
+# 実際の明るさだと真っ暗になる（iPhone は露出を大きく持ち上げて撮っている。2026-11-14 の #499 で、
+# 正面の 1/150 の明るさになった）。明るい所（上位 0.5%）を、自動で合わせたとき（AUTO_BRIGHT）の
+# floor_stops 段下から自動の明るさまでの間に収める。全体を同じ倍率で変えるので、色の比は変わらない。
+# タグは字が読めるよう 1 段（TAG_FLOOR_STOPS）、生地などは正面と同じ濃さを優先して 2 段まで
+# 暗くてよい（白い所の無い生地だけのアップを 1 段にすると、紺のプリントが白っぽく持ち上がった）
+AUTO_BRIGHT = 0.9
+TAG_FLOOR_STOPS = 1.0
+TAG_LABEL = "タグのアップ"
+
+
+def brightness_factor(linear: np.ndarray, floor_stops: float = 2.0) -> float:
+    luminance = linear @ np.array([0.2126, 0.7152, 0.0722], np.float32)
+    bright = float(np.percentile(luminance, 99.5))
+    if bright <= 1e-6:
+        return 1.0
+    return float(np.clip(bright, AUTO_BRIGHT / 2**floor_stops, AUTO_BRIGHT) / bright)
+
+
+def process_closeup(
+    src: Path, out_dir: Path, reference: dict | None = None, label: str | None = None
+) -> dict:
     started = time.time()
     report: dict = {"source_file": src.name, "kind": "closeup", "warnings": []}
     rgb, source = load(src)
@@ -58,7 +82,8 @@ def process_closeup(src: Path, out_dir: Path, reference: dict | None = None) -> 
     scale = exposure.exposure_scale(src) if source == "linear" else None
     report["exposure_scale"] = scale
     if source == "linear" and scale and reference and reference.get("exposure_scale"):
-        linear = correct(rgb, scale, reference)
+        floor = TAG_FLOOR_STOPS if label == TAG_LABEL else 2.0
+        linear = correct(rgb, scale, reference, floor)
         report["color"] = {
             "from": "reference",
             "ratio": round(reference["exposure_scale"] / scale, 4),
