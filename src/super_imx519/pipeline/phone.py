@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 from ..markers import BOARD_MM, MARKER_MM, MODULES, marker_modules
-from . import cleanup, color, framing, rectify, stacking
+from . import cleanup, color, framing, measure, rectify, stacking
 from .finish import Finish, finish
 from .process import FINAL_SIDE, PREVIEW_SIDE, fit, write_jpeg
 
@@ -340,6 +340,12 @@ def process_upload(
     scene = analyze(wall, valid, view, quads, wall_layout)
     erase, foreground, bbox = scene.erase, scene.foreground, scene.bbox
     hook = hook_position(scene, view, wall_layout, report)
+    # 着丈・身幅（おおよそ。measure.py）。測れなくても画像は作る
+    try:
+        report["measurements"] = measure.measure(scene.garment, hook, mm)
+    except Exception as e:  # noqa: BLE001
+        report["measurements"] = None
+        warnings.append(f"採寸できませんでした: {e}")
     (x0, y0, cw, ch), scale = framing.crop_box(hook, mm, composition, bbox)
     if scale > 1:
         warnings.append(

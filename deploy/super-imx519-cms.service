@@ -1,0 +1,18 @@
+# 85store-cms の撮影の元データ（RAW）を取りに行き、補正した商品画像を返す（src/super_imx519/cms.py）。
+# 1 回動いて終わる（処理待ちが無ければすぐ終わる）。super-imx519-cms.timer が 1 分ごとに起こす。
+# 入れ方（sudo は要らない）:
+#   ln -sf ~/orca/super_imx519/deploy/super-imx519-cms.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now super-imx519-cms.timer
+#   journalctl --user -u super-imx519-cms -f
+[Unit]
+Description=85store-cms の撮影の元データを補正して返す
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/orca/super_imx519
+ExecStart=%h/orca/super_imx519/.venv/bin/python -m super_imx519.cms
+Environment=PYTHONUNBUFFERED=1
+# 1 枚 2〜10 秒。112 枚でも収まるように
+TimeoutStartSec=60min

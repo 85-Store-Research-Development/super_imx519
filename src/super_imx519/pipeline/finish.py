@@ -191,9 +191,12 @@ def flatten_background(
     gain = cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR)
     out = to_srgb(linear * gain).astype(np.float32)
     lum = model @ np.array([0.0722, 0.7152, 0.2126])  # BGR の順（対数の重み付けで近似）
+    # 服の所の倍率（BGR の中央値）。アップに同じ仕上げをかけるとき（apply_look）に使う
+    subject_gain = np.median(gain[subject], axis=0) if subject.any() else np.ones(3)
     return out, {
         "light_range": round(float(np.exp(lum.max() - lum.min())), 3),
         "wall_fit_px": int(keep.sum()),
+        "subject_gain": np.round(subject_gain, 4).tolist(),
     }
 
 
@@ -231,28 +234,13 @@ def finish(
         bright_in if bright_in > wall_l else None,
         params.bright_slope,
     )
-    new_y = _luminance(np.interp(lightness, grid, curve)).astype(np.float32)
-    out = linear * (new_y / np.maximum(y, 1e-6))[..., None]
-    peak = out.max(axis=2)
-    over = peak > 1
-    if over.any():  # 収まらない色は、同じ輝度の灰色に寄せる
-        k = (1 - new_y[over]) / np.maximum(peak[over] - new_y[over], 1e-6)
-        out[over] = new_y[over][:, None] + (out[over] - new_y[over][:, None]) * k[:, None]
-    srgb = to_srgb(out).astype(np.float32)
+    srgb, over = _apply_curve(linear, y, lightness, grid, curve)
 
     # 2. 背景の色味（服の内側には寄せない。縁は、色が壁に近いほど強く）
     srgb = tint_background(srgb, subject, mm_per_px, params)
 
     # 3. シャープ（輝度だけ）
-    if params.sharpen > 0:
-        lab = cv2.cvtColor(srgb, cv2.COLOR_BGR2Lab)
-        lum = lab[..., 0]
-        lab[..., 0] = np.clip(
-            lum + params.sharpen * (lum - cv2.GaussianBlur(lum, (0, 0), params.sharpen_sigma)),
-            0,
-            100,
-        )
-        srgb = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    srgb = _sharpen(srgb, params)
 
     wall_after = np.median(cv2.cvtColor(srgb, cv2.COLOR_BGR2Lab)[background], axis=0)
     report = {
@@ -263,7 +251,62 @@ def finish(
         "levels": bool(levels),
         "garment_bright_l": round(bright_in, 1),
         "wall_target_l": round(target, 1),
-        "out_of_gamut_px": int(over.sum()),
+        "out_of_gamut_px": int(over),
         "flatten": flat,
     }
     return srgb, report
+
+
+def _apply_curve(
+    linear: np.ndarray, y: np.ndarray, lightness: np.ndarray, grid: np.ndarray, curve: np.ndarray
+) -> tuple[np.ndarray, int]:
+    """輝度にだけカーブをかける（RGB の比を保つ）。収まらない色は、同じ輝度の灰色に寄せる。"""
+    new_y = _luminance(np.interp(lightness, grid, curve)).astype(np.float32)
+    out = linear * (new_y / np.maximum(y, 1e-6))[..., None]
+    peak = out.max(axis=2)
+    over = peak > 1
+    if over.any():
+        k = (1 - new_y[over]) / np.maximum(peak[over] - new_y[over], 1e-6)
+        out[over] = new_y[over][:, None] + (out[over] - new_y[over][:, None]) * k[:, None]
+    return to_srgb(out).astype(np.float32), int(over.sum())
+
+
+def _sharpen(srgb: np.ndarray, params: Finish) -> np.ndarray:
+    if params.sharpen <= 0:
+        return srgb
+    lab = cv2.cvtColor(srgb, cv2.COLOR_BGR2Lab)
+    lum = lab[..., 0]
+    lab[..., 0] = np.clip(
+        lum + params.sharpen * (lum - cv2.GaussianBlur(lum, (0, 0), params.sharpen_sigma)),
+        0,
+        100,
+    )
+    return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+
+
+def apply_look(image: np.ndarray, look: dict, params: Finish) -> np.ndarray:
+    """同じ商品の正面にかけた仕上げ（finish の report）の明るさのカーブとシャープを、壁の無い写真
+    （アップ。closeup.py）にもかける。背景の色味・むら取りは壁がある写真のものなので、かけない。
+
+    image は BGR（0〜1、sRGB）。正面と同じ露出・色にそろえてあること。
+    """
+    wall_l = float(look["wall_lab_before"][0])
+    levels = bool(look.get("levels"))
+    bright_in = float(look.get("garment_bright_l") or 0.0)
+    grid, curve = tone_curve(
+        wall_l,
+        float(look["wall_target_l"]),
+        params.max_gain,
+        float(look["black_point_l"]) if levels else 0.0,
+        params.black_l if levels else 0.0,
+        bright_in if bright_in > wall_l else None,
+        params.bright_slope,
+    )
+    linear = to_linear(np.clip(image, 0, 1)).astype(np.float32)
+    # 正面では、背景のむら取りで服の所もこの倍率で割られている（明るさをそろえる）
+    flat = look.get("flatten") or {}
+    if flat.get("subject_gain"):
+        linear = linear * np.array(flat["subject_gain"], np.float32)
+    y = linear @ np.array([0.0722, 0.7152, 0.2126], np.float32)
+    srgb, _ = _apply_curve(linear, y, _lightness(y), grid, curve)
+    return _sharpen(srgb, params)
