@@ -114,7 +114,7 @@ def _doc(i, recipe, role, product=1):
 
 
 def _fake_processing(monkeypatch, calls):
-    def wall(src, out):
+    def wall(src, out, **kwargs):
         calls.append(("wall", src.name))
         out.mkdir(parents=True, exist_ok=True)
         (out / "final.jpg").write_bytes(b"j")

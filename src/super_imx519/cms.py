@@ -25,6 +25,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from . import dataset
 from .pipeline import closeup, exposure, phone
 
 CMS_URL = os.getenv("CMS_URL", "https://cms.85-store.com").rstrip("/")
@@ -138,7 +139,15 @@ def process_source(cms: Cms, doc: dict, reference: dict | None, work: Path) -> d
     out = work / f"out-{doc['id']}"
     if doc["recipe"] == "wall":
         try:
-            report = phone.process_upload(src, out)
+            # 採寸のモデル用に、壁の正面図・服の形も残す（dataset.py）
+            report = phone.process_upload(
+                src,
+                out,
+                dataset_dir=dataset.scene_dir(
+                    doc["product"], doc["id"], doc.get("role") or "front"
+                ),
+                dataset_extra=dataset.extra_of(doc["product"], doc),
+            )
         except Exception as e:  # noqa: BLE001 マーカーが見つからないなど。形は直さず、色だけ合わせる
             report = closeup.process_closeup(src, out, reference)
             report["warnings"].insert(
