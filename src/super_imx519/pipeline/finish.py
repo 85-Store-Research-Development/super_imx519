@@ -10,7 +10,11 @@
    多項式）を当て、画像全体をその面で割って平らにする。服も同じ光を受けているので同じ割合で割る
    （服の明暗の傾きも取れる）。割る倍率は flatten_max_gain の範囲に収める
 1. 明るさとレベル補正: 輝度だけにトーンカーブをかけ、RGB の比を保つ（色相を変えない）。収まらない
-   色は、同じ輝度の灰色に寄せて収める
+   色は、色の比を保ったまま明るさを丸めて収める（color.fit_peak）
+   - 色の濃い明るい服（濃いオレンジなど）は、明るさは収まっても 1 つのチャネルが大きく超え、
+     丸めるだけでは濃淡が 255 の手前に詰まって白く飛んで見えた（2026-11-21、River のオレンジ）。
+     服の一番大きいチャネルの 99% 点が garment_peak に収まるよう、服だけを同じ倍率で暗くする
+     （壁は変えない。倍率は report の garment_gain に残し、アップにも同じ倍率をかける）
    - 壁の明るさ（L*）を wall_l にする。壁より明るいところは 100 に向けて丸める
    - 黒点: 画像の一番暗いところ（0.1% 点）を black_l まで下げ、壁までをほぼ直線で引き伸ばす（黒を
      締め、中間も引き締める）。0.1% 点が max_black より明るい写真（暗いところの無い白い服など）では
@@ -31,7 +35,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .color import to_linear, to_srgb
+from .color import fit_peak, to_linear, to_srgb
 
 
 @dataclass
@@ -59,6 +63,15 @@ class Finish:
     flatten_degree: int = 3
     flatten_exclude_mm: float = 40.0  # 服からこれ以内は、服の影が落ちるので面の当てはめに使わない
     flatten_max_gain: float = 1.6  # 割る倍率の上限（と下限 1 / これ）
+    # 色の濃い明るい服（濃いオレンジなど）: カーブのあと、服の一番大きいチャネルの 99% 点が
+    # garment_peak を超えるなら、服だけを同じ倍率で暗くして収める（壁の明るさは変えない。
+    # 倍率は garment_min_gain まで。アップにも同じ倍率をかける）
+    garment_peak: float = 0.97
+    garment_percentile: float = 99.0
+    garment_min_gain: float = 0.5
+    garment_feather_mm: float = 4.0
+    # 服だけの明るさの手直し（1 = そのまま）。同じ生地のセットアップの明るさをそろえるときなど
+    garment_scale: float = 1.0
 
 
 def _pchip(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -189,7 +202,7 @@ def flatten_background(
     gain = np.exp(np.clip(level - model, -np.log(params.flatten_max_gain),
                           np.log(params.flatten_max_gain))).astype(np.float32)  # fmt: skip
     gain = cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR)
-    out = to_srgb(linear * gain).astype(np.float32)
+    out = to_srgb(fit_peak(linear * gain)).astype(np.float32)
     lum = model @ np.array([0.0722, 0.7152, 0.2126])  # BGR の順（対数の重み付けで近似）
     # 服の所の倍率（BGR の中央値）。アップに同じ仕上げをかけるとき（apply_look）に使う
     subject_gain = np.median(gain[subject], axis=0) if subject.any() else np.ones(3)
@@ -234,7 +247,18 @@ def finish(
         bright_in if bright_in > wall_l else None,
         params.bright_slope,
     )
-    srgb, over = _apply_curve(linear, y, lightness, grid, curve)
+    out, over = _curve_linear(linear, y, lightness, grid, curve)
+    garment_gain = 1.0
+    if core.any():
+        peak = float(np.percentile(out[core].max(axis=1), params.garment_percentile))
+        if peak > params.garment_peak:
+            garment_gain = max(params.garment_peak / peak, params.garment_min_gain)
+    garment_gain *= params.garment_scale
+    if garment_gain != 1.0:
+        sigma = max(params.garment_feather_mm / mm_per_px, 1.0)
+        weight = cv2.GaussianBlur(subject.astype(np.float32), (0, 0), sigma)
+        out = out * (1 - (1 - garment_gain) * np.clip(weight, 0, 1))[..., None]
+    srgb = to_srgb(fit_peak(out)).astype(np.float32)
 
     # 2. 背景の色味（服の内側には寄せない。縁は、色が壁に近いほど強く）
     srgb = tint_background(srgb, subject, mm_per_px, params)
@@ -252,23 +276,19 @@ def finish(
         "garment_bright_l": round(bright_in, 1),
         "wall_target_l": round(target, 1),
         "out_of_gamut_px": int(over),
+        "garment_gain": round(garment_gain, 3),
         "flatten": flat,
     }
     return srgb, report
 
 
-def _apply_curve(
+def _curve_linear(
     linear: np.ndarray, y: np.ndarray, lightness: np.ndarray, grid: np.ndarray, curve: np.ndarray
 ) -> tuple[np.ndarray, int]:
-    """輝度にだけカーブをかける（RGB の比を保つ）。収まらない色は、同じ輝度の灰色に寄せる。"""
+    """輝度にだけカーブをかけたリニアな値（RGB の比を保つ。1 を超えうる）と、超えた画素の数。"""
     new_y = _luminance(np.interp(lightness, grid, curve)).astype(np.float32)
     out = linear * (new_y / np.maximum(y, 1e-6))[..., None]
-    peak = out.max(axis=2)
-    over = peak > 1
-    if over.any():
-        k = (1 - new_y[over]) / np.maximum(peak[over] - new_y[over], 1e-6)
-        out[over] = new_y[over][:, None] + (out[over] - new_y[over][:, None]) * k[:, None]
-    return to_srgb(out).astype(np.float32), int(over.sum())
+    return out, int((out.max(axis=2) > 1).sum())
 
 
 def _sharpen(srgb: np.ndarray, params: Finish) -> np.ndarray:
@@ -308,5 +328,7 @@ def apply_look(image: np.ndarray, look: dict, params: Finish) -> np.ndarray:
     if flat.get("subject_gain"):
         linear = linear * np.array(flat["subject_gain"], np.float32)
     y = linear @ np.array([0.0722, 0.7152, 0.2126], np.float32)
-    srgb, _ = _apply_curve(linear, y, _lightness(y), grid, curve)
-    return _sharpen(srgb, params)
+    out, _ = _curve_linear(linear, y, _lightness(y), grid, curve)
+    # 正面で服だけ暗くした倍率（アップは服だけが写っているので、全体にかける）
+    out = out * float(look.get("garment_gain") or 1.0)
+    return _sharpen(to_srgb(fit_peak(out)).astype(np.float32), params)

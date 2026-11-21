@@ -34,6 +34,9 @@ CARD_BORDER_MM = 12.0  # パッチの外側の、カードの黒い台紙の幅
 # 板の外側に消す幅。板は厚さ約 5 mm で、側面とその影が細い線で残った（12 mm では、中心から 63 mm
 # の所に線が残った。2026-11-09）
 BOARD_EDGE_MM = 20.0
+SMOOTH_MM = 6.0  # 板の近くの服の縁で、これより細い出っ張りは落とす
+EDGE_SMOOTH_MM = 1.5  # 板の近くの服の縁を滑らかにするぼかしの幅
+CLOSE_MM = 8.0  # 板の近くの服の、これより細い穴・切れ込みは服に戻す
 DEFAULT_LOOK = Finish()
 MAX_VIEW_SIDE = 8000  # 正面図がこれより大きくなるなら、縮尺を粗くする
 
@@ -93,13 +96,15 @@ def make_view(
     return view, mm
 
 
-WALL, PAPER, INK = 0, 1, 2  # 板の周りの見えるはずのもの
+WALL, PAPER, INK, SIDE = 0, 1, 2, 3  # 板の周りの見えるはずのもの（SIDE: 板の厚みの側面か壁）
+# 板の紙の外のこの幅は、板の厚みの側面や縁の影が見えうる（暗い帯。服の色と取り違えやすい）
+SIDE_MM = 8.0
 
 
 def board_pattern(
     view: rectify.WallView, marker: tuple[float, float, float], marker_id: int, region: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """region の画素に見えるはずのもの。(ys, xs, 種類（WALL・PAPER・INK）, 確かか)。
+    """region の画素に見えるはずのもの。(ys, xs, 種類（WALL・PAPER・INK・SIDE）, 確かか)。
 
     境目の近く（位置のずれやぼけで入れ替わりうる所。2 mm 以内）は「確かでない」とする。
     """
@@ -111,7 +116,9 @@ def board_pattern(
     u = (local + MARKER_MM / 2) / module  # マス単位（0〜MODULES がマーカー）
     inside = ((u >= 0) & (u < MODULES)).all(axis=1)
     reach = np.abs(local).max(axis=1)
-    kind = np.where(reach < BOARD_MM / 2, PAPER, WALL)
+    kind = np.where(
+        reach < BOARD_MM / 2, PAPER, np.where(reach < BOARD_MM / 2 + SIDE_MM, SIDE, WALL)
+    )
     cells = np.clip(np.floor(u[inside]).astype(int), 0, MODULES - 1)
     kind[inside] = np.where(marker_modules(marker_id)[cells[:, 1], cells[:, 0]], INK, PAPER)
     edge = np.minimum(np.abs(reach - MARKER_MM / 2), np.abs(reach - BOARD_MM / 2))
@@ -141,6 +148,9 @@ def ink_color(image: np.ndarray, view: rectify.WallView, layout: rectify.WallLay
     return np.median(samples, axis=0) if samples else np.array([0.35, 0.0, 0.0])
 
 
+CLOTH_MARGIN = 0.6
+
+
 def covered_part(
     image: np.ndarray,
     region: np.ndarray,
@@ -168,18 +178,44 @@ def covered_part(
     if len(paper) < 50:
         return np.zeros(region.shape, bool)
     white = paper[paper[:, 0] >= np.percentile(paper[:, 0], 75)]  # 隠れていない白
-    levels = np.zeros((3, 3), np.float32)
+    levels = np.zeros((4, 3), np.float32)
     levels[WALL] = np.median(lab[ring & ~garment], axis=0)
     levels[PAPER] = np.median(white, axis=0)
     levels[INK] = [levels[PAPER][0] * ink[0], ink[1], ink[2]]
+    # 側面の色は、同じ板の服から離れた辺で測る（無ければ壁と同じ）
+    far = ~cleanup.dilate(garment, 15 / view.mm_per_px)[ys, xs]
+    side = values[(kind == SIDE) & far]
+    levels[SIDE] = np.median(side, axis=0) if len(side) > 50 else levels[WALL]
     cloth = np.median(lab[near_garment], axis=0)
     expected = levels[kind]
     to_board = np.linalg.norm(values - expected, axis=1)
+    # 側面の帯は、側面の色か壁の色の近いほう
+    at_side = kind == SIDE
+    to_board[at_side] = np.minimum(
+        to_board[at_side], np.linalg.norm(values[at_side] - levels[WALL], axis=1)
+    )
     to_cloth = np.linalg.norm(values - cloth, axis=1)
-    decisive = sure & (np.linalg.norm(expected - cloth, axis=1) > 12)
-    vote = np.where(to_cloth < to_board, -1.0, 1.0)
+    decisive = sure & (
+        np.minimum(
+            np.linalg.norm(expected - cloth, axis=1),
+            np.where(at_side, np.linalg.norm(levels[WALL] - cloth), np.inf),
+        )
+        > 12
+    )
+    # 隠れているとするのは、服の色にはっきり近いときだけ（板の縁の影の灰色が、紺の服に少し近いだけで
+    # 服に数えられ、裾の脇に板の切れ端が残った。2026-11-21）。どちらとも言えない画素は周りから決める
+    vote = np.where(
+        to_cloth < CLOTH_MARGIN * to_board, -1.0, np.where(to_board < to_cloth, 1.0, 0.0)
+    )
+    # 側面の帯で迷う画素は、板の側にする（周りの服から埋めると、帯が服の脇に残った）
+    vote[at_side & (vote == 0)] = 1.0
     evidence = np.zeros(region.shape, np.float32)  # +1 見えている、-1 隠れている、0 分からない
     evidence[ys[decisive], xs[decisive]] = vote[decisive]
+    # 柄の境目の近く（確かでない画素）でも、板のどれかの色（白・黒・側面・壁）にはっきり近ければ
+    # 見えている側にする（服との境目で、マーカーの黒い枠の端が服に数えられて残った）
+    to_any = np.linalg.norm(values[:, None, :] - levels[None], axis=2).min(axis=1)
+    board_like = ~sure & (to_any < 0.5 * to_cloth)
+    evidence[ys[board_like], xs[board_like]] = 1.0
     # 「隠れている」の細かい誤り（ノイズ・映り込み）を除く。「見えている」は除かない（服の脇に細く
     # 見えている板の白が消えて、服の側に数えられ、消し残しになった）
     kernel = np.ones((5, 5), np.uint8)
@@ -198,6 +234,34 @@ def covered_part(
     n, labels = cv2.connectedComponents((covered | near_garment).astype(np.uint8))
     touching = np.unique(labels[near_garment])
     return covered & np.isin(labels, touching[touching > 0])
+
+
+def tidy_edge(
+    shape: np.ndarray, region: np.ndarray, mm_per_px: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """板の近くの服の縁を整える。(落として壁で埋める所, 服に戻す所)。
+
+    - 細い出っ張り（板の厚みや影を服に数えたもの。SMOOTH_MM の円が入る太さの本体につながらない所）
+      は落とす
+    - 縁のぎざぎざは、ぼかして半分で切る。外にはみ出した点（紙の白など）は落とす
+    - 服の内側の穴と細い切れ込み（迷って板の側にした布）は服に戻す
+    """
+    zone = cleanup.dilate(region, 10 / mm_per_px)
+
+    def disk(mm: float) -> np.ndarray:
+        r = max(int(mm / mm_per_px), 1)
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+    # 1. 穴・切れ込みを埋める（先に埋めないと、切れ込みで細くなった布が出っ張りとして落ちた）
+    closed = cv2.morphologyEx(shape.astype(np.uint8), cv2.MORPH_CLOSE, disk(CLOSE_MM)) > 0
+    filled = shape | (closed & zone & region)
+    # 2. 細い出っ張りを落とす
+    body = cv2.morphologyEx(filled.astype(np.uint8), cv2.MORPH_OPEN, disk(SMOOTH_MM)) > 0
+    kept = filled & ~(~body & zone)
+    # 3. 縁を滑らかにする
+    smooth = cv2.GaussianBlur(kept.astype(np.float32), (0, 0), EDGE_SMOOTH_MM / mm_per_px) > 0.5
+    final = kept & ~(~smooth & zone)
+    return shape & ~final, final & ~shape
 
 
 def analyze(
@@ -226,12 +290,26 @@ def analyze(
     objects = np.logical_or.reduce([empty, *erase, *(r for _, r in hidden)])
     foreground = framing.foreground_mask(image, valid, exclude=objects)
     garment = framing.garment_component(foreground)
-    ink = ink_color(image, view, layout) if hidden else None
+    # 板のうち服に隠れている所は消さない。見つからなかった板（hidden）だけでなく、見つかった板でも、
+    # 服の裾や脇が板に掛かることがある（2026-11-21、River のパンツの裾が下の板に掛かり、板ごと
+    # 壁で埋めたので、脚の縁が四角く欠けた）
+    found = [(k, i) for k, i in enumerate(view.markers) if layout and i in layout.markers]
+    ink = ink_color(image, view, layout) if (hidden or found) and layout else None
+    boards = [(k, i, erase[k]) for k, i in found]
     for i, region in hidden:
+        erase.append(region)
+        boards.append((len(erase) - 1, i, region))
+    changed = bool(hidden)
+    for k, i, region in boards:
         covered = covered_part(image, region, view, layout.markers[i], i, garment, ink)
-        foreground |= covered
-        erase.append(region & ~covered)
-    if hidden:
+        if not (covered.any() or (cleanup.dilate(region, 2 / view.mm_per_px) & garment).any()):
+            continue
+        spur, holes = tidy_edge(garment | covered, region, view.mm_per_px)
+        covered = (covered | holes) & ~spur
+        foreground = (foreground | covered) & ~spur
+        erase[k] = (region & ~covered) | spur
+        changed = True
+    if changed:
         garment = framing.garment_component(foreground)
     edges = framing.sharp_edges(image, mm) & valid & ~objects
     hook = framing.find_hook(foreground, garment, mm, edges)
@@ -253,7 +331,7 @@ def correct_color(
         report["warnings"].append("カラーカードが見つからないため、色は補正していません")
         linear = rgb / white if source == "linear" else color.to_linear(rgb)
         report["color"] = None
-    return (color.to_srgb(linear)[..., ::-1] * 255).astype(np.float32), quads
+    return (color.to_srgb(color.fit_peak(linear))[..., ::-1] * 255).astype(np.float32), quads
 
 
 def marker_warning(view: rectify.WallView, wall_layout: rectify.WallLayout | None) -> str | None:

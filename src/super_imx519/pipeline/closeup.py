@@ -104,7 +104,7 @@ def process_closeup(
             else color.to_linear(rgb)
         )
         report["color"] = None
-    srgb = color.to_srgb(np.clip(linear, 0, 1))[..., ::-1]  # BGR
+    srgb = color.to_srgb(color.fit_peak(linear))[..., ::-1]  # BGR
     if report["color"] and reference.get("look"):
         srgb = apply_look(np.ascontiguousarray(srgb, np.float32), reference["look"], Finish())
         report["look"] = "reference"

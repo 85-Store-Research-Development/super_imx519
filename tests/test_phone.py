@@ -290,3 +290,56 @@ def test_finish_flattens_uneven_lighting_and_color_on_the_wall():
     gx = np.nonzero(subject)[1]
     assert np.abs(g[gx < 200].mean(0) / g[gx > 400].mean(0) - 1).max() < 0.03
     assert report["flatten"]["light_range"] > 1.4
+
+
+def test_fit_peak_keeps_the_color_ratio_and_the_order():
+    # 赤だけが 1 を超える濃いオレンジ（リニア RGB）。切ると比が崩れるが、fit_peak は比を保つ
+    x = np.array([[1.2, 0.35, 0.1], [1.5, 0.45, 0.12], [0.5, 0.5, 0.5]], np.float32)
+    y = color.fit_peak(x)
+    assert y.max() <= 1
+    assert np.allclose(y[0] / y[0, 0], x[0] / x[0, 0], atol=1e-5)
+    assert y[1, 0] > y[0, 0]  # 明るい方が明るいまま
+    assert np.allclose(y[2], x[2])  # knee より暗い所は変えない
+
+
+def test_finish_darkens_only_a_vivid_bright_garment_to_keep_its_texture():
+    from super_imx519.pipeline.color import to_srgb
+    from super_imx519.pipeline.finish import Finish, apply_look, finish
+
+    h, w = 600, 400
+    linear = np.full((h, w, 3), 0.55, np.float32)  # 灰色の壁（BGR）
+    subject = np.zeros((h, w), bool)
+    subject[150:450, 100:300] = True
+    rng = np.random.default_rng(0)
+    texture = 1 + 0.15 * rng.standard_normal((300, 200, 1)).astype(np.float32)
+    orange = np.array([0.05, 0.3, 0.95], np.float32)  # BGR。濃いオレンジ
+    linear[subject] = (orange * texture).reshape(-1, 3)
+    image = to_srgb(linear).astype(np.float32)
+    look = Finish(sharpen=0)
+    out, report = finish(image, subject, 1.0, look)
+    assert report["garment_gain"] < 1
+    after = cv2.cvtColor(out.astype(np.float32), cv2.COLOR_BGR2Lab)
+    assert after[20:100, 20:100, 0].mean() == pytest.approx(look.wall_l, abs=0.6)  # 壁はそのまま
+    red = out[200:400, 150:250, 2]
+    assert (red >= 254 / 255).mean() < 0.05  # 赤が張り付かない
+    assert red.std() > 0.03  # 生地の濃淡が残る
+    # アップにも同じ倍率がかかる
+    crop = image[200:400, 150:250]
+    closeup = apply_look(np.ascontiguousarray(crop), report, look)
+    assert (closeup[..., 2] >= 254 / 255).mean() < 0.05
+
+
+def test_finish_garment_scale_changes_only_the_garment():
+    from super_imx519.pipeline.finish import Finish, finish
+
+    lab = np.zeros((600, 400, 3), np.float32)
+    lab[...] = (78, 1.5, 4.3)
+    lab[150:450, 100:300] = (45, 10, 20)
+    image = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    subject = np.zeros((600, 400), bool)
+    subject[150:450, 100:300] = True
+    base, r1 = finish(image, subject, 1.0, Finish(sharpen=0))
+    dark, r2 = finish(image, subject, 1.0, Finish(sharpen=0, garment_scale=0.8))
+    assert r2["garment_gain"] == pytest.approx(r1["garment_gain"] * 0.8)
+    assert np.allclose(dark[20:100, 20:100], base[20:100, 20:100], atol=1e-3)  # 壁は同じ
+    assert dark[300, 200].mean() < base[300, 200].mean()

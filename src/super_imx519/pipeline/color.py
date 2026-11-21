@@ -32,6 +32,28 @@ def to_linear(srgb: np.ndarray) -> np.ndarray:
     return np.where(srgb <= 0.04045, srgb / 12.92, ((np.maximum(srgb, 0) + 0.055) / 1.055) ** 2.4)
 
 
+# 色の濃い明るいもの（濃いオレンジなど）は、明るさは収まっていても、カードで合わせると 1 つの
+# チャネル（赤）だけが 1 を超える。チャネルごとに切ると、そのチャネルの濃淡が消え、色相もずれて
+# 白っぽく飛んで見えた（2026-11-21、River のオレンジのジャケット・パンツ）。一番大きいチャネルが
+# KNEE を超える画素は、その値を 1 に向けて滑らかに丸め、画素の RGB を同じ割合で縮める（色の比 =
+# 色相と彩度を保ち、明るさだけを下げる。順序は崩れないので、生地の濃淡は残る）
+KNEE = 0.9
+
+
+def fit_peak(linear: np.ndarray, knee: float = KNEE) -> np.ndarray:
+    """リニアな RGB（最後の軸が色）の、1 を超えるところを色の比を保って 1 以下に収める。"""
+    linear = np.maximum(np.asarray(linear, np.float32), 0)
+    peak = linear.max(axis=-1)
+    over = peak > knee
+    if not over.any():
+        return linear
+    room = 1 - knee
+    fitted = knee + room * np.tanh((peak[over] - knee) / room)
+    out = linear.copy()
+    out[over] *= (fitted / peak[over])[:, None]
+    return out
+
+
 def to_srgb(linear: np.ndarray) -> np.ndarray:
     linear = np.clip(linear, 0, 1)
     return np.where(linear <= 0.0031308, linear * 12.92, 1.055 * linear ** (1 / 2.4) - 0.055)
