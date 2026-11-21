@@ -327,3 +327,19 @@ def test_finish_darkens_only_a_vivid_bright_garment_to_keep_its_texture():
     crop = image[200:400, 150:250]
     closeup = apply_look(np.ascontiguousarray(crop), report, look)
     assert (closeup[..., 2] >= 254 / 255).mean() < 0.05
+
+
+def test_finish_garment_scale_changes_only_the_garment():
+    from super_imx519.pipeline.finish import Finish, finish
+
+    lab = np.zeros((600, 400, 3), np.float32)
+    lab[...] = (78, 1.5, 4.3)
+    lab[150:450, 100:300] = (45, 10, 20)
+    image = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    subject = np.zeros((600, 400), bool)
+    subject[150:450, 100:300] = True
+    base, r1 = finish(image, subject, 1.0, Finish(sharpen=0))
+    dark, r2 = finish(image, subject, 1.0, Finish(sharpen=0, garment_scale=0.8))
+    assert r2["garment_gain"] == pytest.approx(r1["garment_gain"] * 0.8)
+    assert np.allclose(dark[20:100, 20:100], base[20:100, 20:100], atol=1e-3)  # 壁は同じ
+    assert dark[300, 200].mean() < base[300, 200].mean()

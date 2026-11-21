@@ -70,6 +70,8 @@ class Finish:
     garment_percentile: float = 99.0
     garment_min_gain: float = 0.5
     garment_feather_mm: float = 4.0
+    # 服だけの明るさの手直し（1 = そのまま）。同じ生地のセットアップの明るさをそろえるときなど
+    garment_scale: float = 1.0
 
 
 def _pchip(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -251,9 +253,11 @@ def finish(
         peak = float(np.percentile(out[core].max(axis=1), params.garment_percentile))
         if peak > params.garment_peak:
             garment_gain = max(params.garment_peak / peak, params.garment_min_gain)
-            sigma = max(params.garment_feather_mm / mm_per_px, 1.0)
-            weight = cv2.GaussianBlur(subject.astype(np.float32), (0, 0), sigma)
-            out = out * (1 - (1 - garment_gain) * np.clip(weight, 0, 1))[..., None]
+    garment_gain *= params.garment_scale
+    if garment_gain != 1.0:
+        sigma = max(params.garment_feather_mm / mm_per_px, 1.0)
+        weight = cv2.GaussianBlur(subject.astype(np.float32), (0, 0), sigma)
+        out = out * (1 - (1 - garment_gain) * np.clip(weight, 0, 1))[..., None]
     srgb = to_srgb(fit_peak(out)).astype(np.float32)
 
     # 2. 背景の色味（服の内側には寄せない。縁は、色が壁に近いほど強く）
