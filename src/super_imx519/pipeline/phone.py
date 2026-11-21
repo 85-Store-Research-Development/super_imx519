@@ -253,7 +253,7 @@ def correct_color(
         report["warnings"].append("カラーカードが見つからないため、色は補正していません")
         linear = rgb / white if source == "linear" else color.to_linear(rgb)
         report["color"] = None
-    return (color.to_srgb(linear)[..., ::-1] * 255).astype(np.float32), quads
+    return (color.to_srgb(color.fit_peak(linear))[..., ::-1] * 255).astype(np.float32), quads
 
 
 def marker_warning(view: rectify.WallView, wall_layout: rectify.WallLayout | None) -> str | None:
