@@ -35,6 +35,8 @@ CARD_BORDER_MM = 12.0  # パッチの外側の、カードの黒い台紙の幅
 # の所に線が残った。2026-11-09）
 BOARD_EDGE_MM = 20.0
 SMOOTH_MM = 6.0  # 板の近くの服の縁で、これより細い出っ張りは落とす
+EDGE_SMOOTH_MM = 1.5  # 板の近くの服の縁を滑らかにするぼかしの幅
+CLOSE_MM = 8.0  # 板の近くの服の、これより細い穴・切れ込みは服に戻す
 DEFAULT_LOOK = Finish()
 MAX_VIEW_SIDE = 8000  # 正面図がこれより大きくなるなら、縮尺を粗くする
 
@@ -234,6 +236,34 @@ def covered_part(
     return covered & np.isin(labels, touching[touching > 0])
 
 
+def tidy_edge(
+    shape: np.ndarray, region: np.ndarray, mm_per_px: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """板の近くの服の縁を整える。(落として壁で埋める所, 服に戻す所)。
+
+    - 細い出っ張り（板の厚みや影を服に数えたもの。SMOOTH_MM の円が入る太さの本体につながらない所）
+      は落とす
+    - 縁のぎざぎざは、ぼかして半分で切る。外にはみ出した点（紙の白など）は落とす
+    - 服の内側の穴と細い切れ込み（迷って板の側にした布）は服に戻す
+    """
+    zone = cleanup.dilate(region, 10 / mm_per_px)
+
+    def disk(mm: float) -> np.ndarray:
+        r = max(int(mm / mm_per_px), 1)
+        return cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+
+    # 1. 穴・切れ込みを埋める（先に埋めないと、切れ込みで細くなった布が出っ張りとして落ちた）
+    closed = cv2.morphologyEx(shape.astype(np.uint8), cv2.MORPH_CLOSE, disk(CLOSE_MM)) > 0
+    filled = shape | (closed & zone & region)
+    # 2. 細い出っ張りを落とす
+    body = cv2.morphologyEx(filled.astype(np.uint8), cv2.MORPH_OPEN, disk(SMOOTH_MM)) > 0
+    kept = filled & ~(~body & zone)
+    # 3. 縁を滑らかにする
+    smooth = cv2.GaussianBlur(kept.astype(np.float32), (0, 0), EDGE_SMOOTH_MM / mm_per_px) > 0.5
+    final = kept & ~(~smooth & zone)
+    return shape & ~final, final & ~shape
+
+
 def analyze(
     image: np.ndarray,
     valid: np.ndarray,
@@ -261,31 +291,25 @@ def analyze(
     foreground = framing.foreground_mask(image, valid, exclude=objects)
     garment = framing.garment_component(foreground)
     # 板のうち服に隠れている所は消さない。見つからなかった板（hidden）だけでなく、見つかった板でも、
-    # 服の裾や脇が板の余白に掛かることがある（2026-11-21、River のパンツの裾が下の板に掛かり、板ごと
+    # 服の裾や脇が板に掛かることがある（2026-11-21、River のパンツの裾が下の板に掛かり、板ごと
     # 壁で埋めたので、脚の縁が四角く欠けた）
     found = [(k, i) for k, i in enumerate(view.markers) if layout and i in layout.markers]
     ink = ink_color(image, view, layout) if (hidden or found) and layout else None
-    changed = False
-    for k, i in found:
-        covered = covered_part(image, erase[k], view, layout.markers[i], i, garment, ink)
-        if not (covered.any() or (cleanup.dilate(erase[k], 2 / view.mm_per_px) & garment).any()):
-            continue
-        # 板の近くの服の縁から、細い出っ張り（板の厚みや影を服に数えたもの）を落として壁で埋める。
-        # 服の本体（SMOOTH_MM の円が入る太さ）につながる所だけ残す
-        shape = garment | covered
-        r = max(int(SMOOTH_MM / view.mm_per_px), 1)
-        disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
-        body = cv2.morphologyEx(shape.astype(np.uint8), cv2.MORPH_OPEN, disk) > 0
-        spur = shape & ~body & cleanup.dilate(erase[k], 10 / view.mm_per_px)
-        covered &= ~spur
-        foreground = (foreground | covered) & ~spur
-        erase[k] = (erase[k] & ~covered) | spur
-        changed = True
+    boards = [(k, i, erase[k]) for k, i in found]
     for i, region in hidden:
+        erase.append(region)
+        boards.append((len(erase) - 1, i, region))
+    changed = bool(hidden)
+    for k, i, region in boards:
         covered = covered_part(image, region, view, layout.markers[i], i, garment, ink)
-        foreground |= covered
-        erase.append(region & ~covered)
-    if hidden or changed:
+        if not (covered.any() or (cleanup.dilate(region, 2 / view.mm_per_px) & garment).any()):
+            continue
+        spur, holes = tidy_edge(garment | covered, region, view.mm_per_px)
+        covered = (covered | holes) & ~spur
+        foreground = (foreground | covered) & ~spur
+        erase[k] = (region & ~covered) | spur
+        changed = True
+    if changed:
         garment = framing.garment_component(foreground)
     edges = framing.sharp_edges(image, mm) & valid & ~objects
     hook = framing.find_hook(foreground, garment, mm, edges)
