@@ -22,6 +22,9 @@ SHADOW_MM = 40.0  # 影を探す範囲（物の縁から）
 SHADOW_LEVEL = (2.0, 30.0)  # 周りの壁よりこの範囲で暗ければ影
 RING_MM = (4.0, 30.0)  # 壁の色を当てはめる帯（消す範囲の外側）
 PROTECT_MM = 6.0  # 服・ハンガーの周りで書き換えない幅
+# 板・カードの近く（影を探す範囲）では、服の周りの書き換えない幅をここまで狭める（服の裾が板に
+# 接していると、板の影が服の脇に残った。2026-11-21、River のパンツ）
+PROTECT_NEAR_OBJECT_MM = 1.5
 SIGMA = 20.0  # これより細かい成分を「質感」とみなす（画素）
 BLOCK, OVERLAP = 96, 32  # 質感を借りるブロックの一辺と重なり（画素）
 KERNEL = np.ones((3, 3), np.uint8)
@@ -209,7 +212,12 @@ def protect_mask(
     """
     px = 1 / mm_per_px
     edges = sharp_edges(image, mm_per_px) & ~dilate(objects, 8)
-    return dilate(foreground & ~objects, PROTECT_MM * px) | dilate(edges, 3 * px)
+    garment = foreground & ~objects
+    near = dilate(objects, SHADOW_MM * px)
+    band = np.where(
+        near, dilate(garment, PROTECT_NEAR_OBJECT_MM * px), dilate(garment, PROTECT_MM * px)
+    )
+    return band | dilate(edges, 3 * px)
 
 
 def remove_objects(
