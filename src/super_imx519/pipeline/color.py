@@ -81,8 +81,7 @@ def gray_tone(gained: np.ndarray, ref: np.ndarray) -> np.ndarray | None:
     """明るさのカーブの点（n × 2。補正したあとの輝度 → 基準の輝度。暗い順）。
 
     gained は補正（倍率と行列）をかけたパッチの値（24 × 3）。輝度が明るい順に並んでいない点
-    （飛んだ白など）は
-    外す。2 点に満たなければ None（カーブはかけない）。
+    （飛んだ白など）は外す。2 点に満たなければ None（カーブはかけない）。
     """
     x, y = gained[TONE_GRAYS] @ LUMA, ref[TONE_GRAYS] @ LUMA
     keep = [0]
