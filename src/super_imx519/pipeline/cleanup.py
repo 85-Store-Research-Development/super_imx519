@@ -78,6 +78,7 @@ class WallFiller:
         """
         self.image, self.valid, self.protect = image, valid, protect
         self.unfilled = np.zeros(image.shape[:2], bool) if unfilled is None else unfilled.copy()
+        self.filled = np.zeros(image.shape[:2], bool)  # 壁で埋めた所（もう服でも影でもない）
         self.px = 1 / mm_per_px
         h, w = image.shape[:2]
         self.yy, self.xx = np.mgrid[0:h, 0:w]
@@ -183,6 +184,7 @@ class WallFiller:
         fill = base[fy - y0, fx - x0] + self.synth_texture(fy, fx)
         self.image[fy, fx] = fill
         self.unfilled &= ~inner
+        self.filled[fy, fx] = True
         return len(fy)
 
     def with_shadow(self, mask: np.ndarray, others: np.ndarray) -> np.ndarray:

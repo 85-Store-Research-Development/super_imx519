@@ -105,8 +105,18 @@ class Cms:
         self._json(f"/api/photoSources/{source_id}/error", "POST", {"message": message[:2000]})
 
 
+def shot_order(doc: dict) -> tuple:
+    """基準を選ぶ順: 正面が先、その中では撮影時刻の早い順（時刻が無ければファイル名）。"""
+    capture = doc.get("capture") if isinstance(doc.get("capture"), dict) else {}
+    return (
+        0 if doc.get("role") == "front" else 1,
+        capture.get("takenAt") or "9999",
+        doc.get("filename") or "",
+    )
+
+
 def reference_of(sources: list[dict]) -> dict | None:
-    """済んだ正面（無ければ背面）の report から、アップに当てる補正の値。"""
+    """色の基準: カードで補正できた全体写真（撮影時刻が最初の正面。無ければ背面）の補正の値。"""
     done = [
         s
         for s in sources
@@ -114,7 +124,7 @@ def reference_of(sources: list[dict]) -> dict | None:
         and s.get("status") == "done"
         and isinstance(s.get("report"), dict)
     ]
-    done.sort(key=lambda s: 0 if s.get("role") == "front" else 1)
+    done.sort(key=shot_order)
     for s in done:
         ref = closeup.reference_from(s["report"], s["report"].get("exposure_scale"))
         if ref:
@@ -138,7 +148,8 @@ def process_source(cms: Cms, doc: dict, reference: dict | None, work: Path) -> d
     out = work / f"out-{doc['id']}"
     if doc["recipe"] == "wall":
         try:
-            report = phone.process_upload(src, out)
+            # 明るさのカーブは基準の写真のもの（露出と WB は、この写真のカードで合わせる）
+            report = phone.process_upload(src, out, tone=(reference or {}).get("tone"))
         except Exception as e:  # noqa: BLE001 マーカーが見つからないなど。形は直さず、色だけ合わせる
             report = closeup.process_closeup(src, out, reference, doc.get("label"))
             report["warnings"].insert(
@@ -166,7 +177,8 @@ def run_once(cms: Cms | None = None, log=print) -> int:
     with tempfile.TemporaryDirectory(prefix="cms-intake-") as tmp:
         work = Path(tmp)
         for product, todo in by_product.items():
-            todo.sort(key=lambda d: ORDER.get((d["recipe"], d.get("role")), 2))
+            # 正面（撮影時刻の早い順）→ 背面 → アップ。最初に処理した全体写真が基準になる
+            todo.sort(key=lambda d: (ORDER.get((d["recipe"], d.get("role")), 2), shot_order(d)))
             sources = cms.product_sources(product)
             reference = reference_of(sources)
             mine = {d["id"] for d in todo}

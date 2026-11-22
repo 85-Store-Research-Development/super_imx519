@@ -99,6 +99,70 @@ def test_card_correction_recovers_reference_colors():
     assert c.delta_e_after.mean() < 1.5 < c.delta_e_before.mean()
 
 
+def _compressed(ref: np.ndarray) -> np.ndarray:
+    """明るい所が圧縮された測定値（iPhone の ProRAW のように、明るいグレーの差が詰まる）。"""
+    y = ref @ color.LUMA
+    return ref * (np.minimum(y, 0.3 + 0.35 * (y - 0.3).clip(0)) / y)[:, None] * 0.05
+
+
+def test_gray_tone_matches_the_card_grays_and_keeps_the_color_ratio():
+    ref = color.reference_linear()
+    c = color.fit_card(_compressed(ref), "linear")
+    out = color.apply_tone(c.apply(_compressed(ref)), c.tone)
+    y = out @ color.LUMA
+    # 白〜neutral 3.5 の明るさが、基準どおりになる（倍率だけでは白が暗く、中間が明るい）
+    assert y[color.TONE_GRAYS] == pytest.approx((ref @ color.LUMA)[color.TONE_GRAYS], rel=0.02)
+    plain = c.apply(_compressed(ref)) @ color.LUMA
+    assert plain[18] < 0.8 * (ref @ color.LUMA)[18] and plain[21] > 1.05 * (ref @ color.LUMA)[21]
+    # RGB の比（色相と彩度）は変えない
+    before = c.apply(_compressed(ref))[6]
+    assert out[6] / out[6].sum() == pytest.approx(before / before.sum(), abs=1e-4)
+    assert c.report()["tone"] is not None
+
+
+def test_fit_card_uses_the_reference_tone_and_its_own_exposure():
+    ref = color.reference_linear()
+    first = color.fit_card(_compressed(ref), "linear")
+    # 同じ商品の別の写真: 露出が 3 倍、少し色かぶり。カーブは基準のものを使う
+    other = color.fit_card(_compressed(ref) * [3.0, 3.3, 2.7], "linear", first.tone)
+    assert other.tone == pytest.approx(first.tone)
+    assert other.gain == pytest.approx(first.gain / [3.0, 3.3, 2.7], rel=1e-6)
+    out = color.apply_tone(other.apply(_compressed(ref) * [3.0, 3.3, 2.7]), other.tone)
+    assert (out @ color.LUMA)[color.TONE_GRAYS] == pytest.approx(
+        (ref @ color.LUMA)[color.TONE_GRAYS], rel=0.02
+    )
+
+
+def test_linear_card_without_compression_gets_an_identity_tone():
+    ref = color.reference_linear()
+    c = color.fit_card(ref * 0.2, "linear")
+    x = np.linspace(0.02, 1.2, 30)[:, None] * np.ones(3)
+    assert color.apply_tone(x, c.tone) == pytest.approx(x, rel=0.01)
+    assert color.apply_tone(x, None) is x
+
+
+def test_closeup_uses_its_own_card_when_one_is_in_the_photo(tmp_path):
+    from super_imx519.pipeline import closeup
+
+    card = cv2.resize(_card(), None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+    photo = np.full((card.shape[0] + 400, card.shape[1] + 400, 3), 150, np.uint8)
+    photo[200 : 200 + card.shape[0], 200 : 200 + card.shape[1]] = card
+    tinted = np.clip(photo.astype(np.float32) * [0.75, 0.9, 1.0], 0, 255).astype(
+        np.uint8
+    )  # 黄かぶり
+    src = tmp_path / "up.png"
+    cv2.imwrite(str(src), tinted)
+    report = closeup.process_closeup(src, tmp_path / "out", None, "タグのアップ")
+    assert report["color"]["from"] == "card" and report["warnings"] == []
+    out = cv2.imread(str(tmp_path / "out" / "final.jpg")).astype(np.float32)
+    wall = out[20:150, 20:150].reshape(-1, 3).mean(0)
+    assert wall.max() - wall.min() < 6  # かぶりが取れて、灰色の地が無彩色になる
+    # カードが無い写真は、基準が無ければ補正せず、そのことを残す
+    cv2.imwrite(str(src), np.clip(photo * 0 + [110, 135, 150], 0, 255).astype(np.uint8))
+    report = closeup.process_closeup(src, tmp_path / "out2", None, None)
+    assert report["color"] is None and report["warnings"]
+
+
 def test_crop_is_fixed_unless_the_garment_overflows():
     layout = framing.Layout(width_mm=900, hook_cut_mm=40, margin=0.03)
     hook = (1000.0, 200.0)
@@ -250,7 +314,8 @@ def test_finish_brightens_the_wall_and_keeps_the_garment_hue():
     garment = after[300, 200]
     hue = lambda v: np.degrees(np.arctan2(v[2], v[1]))  # noqa: E731
     assert abs(hue(garment) - hue(before)) < 3  # 色相はほぼそのまま
-    assert garment[0] > before[0]  # 明るさは、壁と同じカーブで少し持ち上がる
+    # 服にはカーブをかけない（カードで合わせた明るさのまま）
+    assert garment[0] == pytest.approx(before[0], abs=0.5)
 
 
 def test_finish_lowers_the_wall_target_for_light_garments():
@@ -290,6 +355,36 @@ def test_finish_flattens_uneven_lighting_and_color_on_the_wall():
     gx = np.nonzero(subject)[1]
     assert np.abs(g[gx < 200].mean(0) / g[gx > 400].mean(0) - 1).max() < 0.03
     assert report["flatten"]["light_range"] > 1.4
+    # 服の明るさ・色は変えない（むら取りの基準は服の所。カードで合わせた値のまま）
+    assert report["flatten"]["subject_gain"] == pytest.approx([1, 1, 1], abs=0.01)
+    middle = subject & (np.abs(xx - 300) < 20)
+    assert to_linear(out)[middle].mean(0) == pytest.approx(
+        to_linear(image)[middle].mean(0), rel=0.03
+    )
+
+
+def test_finish_applies_the_card_tone_to_the_garment_only():
+    from super_imx519.pipeline.color import to_linear
+    from super_imx519.pipeline.finish import Finish, finish
+
+    lab = np.zeros((600, 400, 3), np.float32)
+    lab[...] = (78, 0, 0)
+    lab[150:450, 100:300] = (50, 30, 30)
+    lab[20:60, 300:380] = (70, 0, 0)  # 壁に残った板の影（前景には入るが、服ではない）
+    image = np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1)
+    garment = np.zeros((600, 400), bool)
+    garment[150:450, 100:300] = True
+    subject = garment.copy()
+    subject[20:60, 300:380] = True
+    tone = [[0.05, 0.04], [0.5, 0.4]]  # 全体を 0.8 倍
+    look = Finish(sharpen=0, flatten=False)
+    out, report = finish(image, subject, 1.0, look, tone, garment)
+    assert report["garment_kept"] is True
+    ratio = to_linear(out)[300, 200] / to_linear(image)[300, 200]
+    assert ratio == pytest.approx([0.8, 0.8, 0.8], abs=0.02)  # 服はカードのカーブだけ
+    after = cv2.cvtColor(out.astype(np.float32), cv2.COLOR_BGR2Lab)
+    assert after[500, 50, 0] == pytest.approx(look.wall_l, abs=0.6)  # 壁は今までどおり
+    assert after[40, 340, 0] > 85  # 板の影の残りは、服として残さず壁として明るくする
 
 
 def test_fit_peak_keeps_the_color_ratio_and_the_order():

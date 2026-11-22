@@ -1,12 +1,16 @@
 """アップ（タグ・生地・プリントなど）の写真から、商品画像を作る（cms.py が呼ぶ）。
 
-アップの写真にはカラーカードも壁のマーカーも写っていないので、形は直さず、色だけを合わせる。
-同じ商品の正面（か背面）の写真をカードで補正したときの値（reference）を受け取り、
-明るさ（露出。exposure.py）をそろえてから同じ補正を当てる。続けて撮った写真は照明が同じなので、
-正面と色がそろう（2026-11-14 に、同じ服の 6 枚で確かめた）。
+色の基準は、カラーカードが写っている全体写真（店主の決定。2026-11-22）。アップは形を直さず、
+色だけを合わせる。
 
-reference が無い・露出が分からないときは、その写真だけで明るさを合わせる（色は iPhone の
-ホワイトバランスのまま）。report の warnings に書く。
+1. アップにカードが写っていれば、そのカードで露出とホワイトバランスを合わせる（明るさのカーブは
+   基準の写真のもの。color.fit_card）。どのカードも同じ基準値に合わせるので、基準の写真とそろう
+2. 写っていなければ、同じ商品の基準の写真（最初の正面。無ければ背面）をカードで補正したときの値
+   （reference）を受け取り、明るさ（撮影情報の露出。exposure.py）をそろえてから同じ補正を当てる。
+   iPhone が 1 枚ごとに決めた色味は RAW に入っていて戻せないので、基準とずれることがある
+   （超広角で寄ったアップは暗く赤くなりやすい）。report の color.from が "reference" のものがこれ
+3. 基準が無い・露出が分からないときは、色は補正しない（その写真だけで明るさを合わせる。色は
+   iPhone のホワイトバランスのまま）。report の warnings に書く
 """
 
 import json
@@ -17,7 +21,7 @@ import numpy as np
 
 from . import color, exposure
 from .finish import Finish, apply_look
-from .phone import load
+from .phone import detection_image, load
 from .process import FINAL_SIDE, PREVIEW_SIDE, fit, write_jpeg
 
 
@@ -27,6 +31,9 @@ def reference_from(report: dict, scale: float | None) -> dict | None:
     if not c or c.get("source") != "linear" or not scale:
         return None
     ref = {"gain": c["gain"], "gamma": c["gamma"], "matrix": c["matrix"], "exposure_scale": scale}
+    # 明るさのカーブ（color.gray_tone）。古い report には無い（そのときはカーブなし）
+    if c.get("tone"):
+        ref["tone"] = c["tone"]
     # 正面にかけた仕上げ（明るさのカーブ）も同じにする
     finish = report.get("finish")
     if isinstance(finish, dict) and "wall_target_l" in finish:
@@ -49,6 +56,7 @@ def correct(
     )
     values = rgb * (ref_scale / scale)
     out = correction.apply(values.reshape(-1, 3)).reshape(rgb.shape)
+    out = color.apply_tone(out, reference.get("tone"))
     return out * brightness_factor(out, floor_stops)
 
 
@@ -71,6 +79,26 @@ def brightness_factor(linear: np.ndarray, floor_stops: float = 2.0) -> float:
     return float(np.clip(bright, AUTO_BRIGHT / 2**floor_stops, AUTO_BRIGHT) / bright)
 
 
+# カードとみなす補正後の誤差（ΔE2000 の平均）の上限。本物のカードは 5 前後。生地の柄などをカードと
+# 見まちがえたときは大きく外れるので、そのときはカードが無いものとして扱う
+CARD_MAX_DELTA_E = 10.0
+
+
+def own_card(rgb: np.ndarray, source: str, reference: dict | None) -> color.CardCorrection | None:
+    """この写真に写っているカードでの補正（写っていない・カードらしくなければ None）。"""
+    detect, _ = detection_image(rgb, source)
+    quads = color.find_card(detect)
+    if quads is None:
+        return None
+    tone = reference.get("tone") if reference and source == "linear" else None
+    correction = color.fit_card(color.sample_patches(rgb, quads), source, tone)
+    if not np.isfinite(correction.delta_e_after).all():
+        return None
+    if float(correction.delta_e_after.mean()) > CARD_MAX_DELTA_E:
+        return None
+    return correction
+
+
 def process_closeup(
     src: Path, out_dir: Path, reference: dict | None = None, label: str | None = None
 ) -> dict:
@@ -81,7 +109,12 @@ def process_closeup(
     report["source_size"] = [rgb.shape[1], rgb.shape[0]]
     scale = exposure.exposure_scale(src) if source == "linear" else None
     report["exposure_scale"] = scale
-    if source == "linear" and scale and reference and reference.get("exposure_scale"):
+    card = own_card(rgb, source, reference)
+    if card is not None:
+        # この写真のカードで露出と WB を合わせる（実際の明るさなので、明るさの手直しはしない）
+        linear = color.apply_tone(card.apply(rgb.reshape(-1, 3)).reshape(rgb.shape), card.tone)
+        report["color"] = {**card.report(), "from": "card"}
+    elif source == "linear" and scale and reference and reference.get("exposure_scale"):
         floor = TAG_FLOOR_STOPS if label == TAG_LABEL else 2.0
         linear = correct(rgb, scale, reference, floor)
         report["color"] = {
@@ -93,7 +126,7 @@ def process_closeup(
             report["warnings"].append("RAW ではないので、色は補正していません")
         elif not reference:
             report["warnings"].append(
-                "同じ商品の正面のカラーカードが無いので、色は補正していません"
+                "基準にするカラーカードの写った全体写真が無いので、色は補正していません"
             )
         else:
             report["warnings"].append("露出が分からないので、色は補正していません")
@@ -105,7 +138,7 @@ def process_closeup(
         )
         report["color"] = None
     srgb = color.to_srgb(color.fit_peak(linear))[..., ::-1]  # BGR
-    if report["color"] and reference.get("look"):
+    if report["color"] and reference and reference.get("look"):
         srgb = apply_look(np.ascontiguousarray(srgb, np.float32), reference["look"], Finish())
         report["look"] = "reference"
     final = fit(srgb, FINAL_SIDE)
