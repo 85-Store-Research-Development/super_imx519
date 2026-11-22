@@ -438,3 +438,32 @@ def test_finish_garment_scale_changes_only_the_garment():
     assert r2["garment_gain"] == pytest.approx(r1["garment_gain"] * 0.8)
     assert np.allclose(dark[20:100, 20:100], base[20:100, 20:100], atol=1e-3)  # 壁は同じ
     assert dark[300, 200].mean() < base[300, 200].mean()
+
+
+def test_garments_close_to_the_wall_color_are_treated_like_the_wall():
+    """白やグレーの服は壁と同じに扱う（服と壁でかけ方を分けると、判定のずれが白い抜けになる）。"""
+    from super_imx519.pipeline.color import to_linear
+    from super_imx519.pipeline.finish import Finish, apply_look, finish
+
+    def scene(garment_lab):
+        lab = np.zeros((600, 400, 3), np.float32)
+        lab[...] = (70, 0, 0)
+        lab[150:450, 100:300] = garment_lab
+        garment = np.zeros((600, 400), bool)
+        garment[150:450, 100:300] = True
+        return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1), garment
+
+    look = Finish(sharpen=0, flatten=False)
+    tone = [[0.05, 0.04], [0.5, 0.4]]  # 服にかけるカードのカーブ（0.8 倍）
+    ratios = {}
+    for name, garment_lab in (("navy", (25, 5, -30)), ("gray", (62, 0, 0))):
+        image, garment = scene(garment_lab)
+        out, report = finish(image, garment, 1.0, look, tone, garment)
+        ratios[name] = float((to_linear(out)[300, 200] / to_linear(image)[300, 200]).mean())
+        # アップ（服の範囲が分からない）も、同じ規則になる
+        up = apply_look(image, report, look, tone)
+        assert float(
+            (to_linear(up)[300, 200] / to_linear(image)[300, 200]).mean()
+        ) == pytest.approx(ratios[name], rel=0.05)
+    assert ratios["navy"] == pytest.approx(0.8, abs=0.02)  # 壁と違う色の服: カードのカーブだけ
+    assert ratios["gray"] > 1.3  # 壁に近いグレー: 壁と同じカーブで明るくなる（今までどおり）
