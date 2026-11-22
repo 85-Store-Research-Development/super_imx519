@@ -8,9 +8,16 @@
    による色の傾き）と周辺減光で、背景が場所ごとに明るさも色もむらになった。壁（服とその影から
    flatten_exclude_mm より離れた所）のリニアな RGB の対数に、チャネルごとに滑らかな面（3 次の
    多項式）を当て、画像全体をその面で割って平らにする。服も同じ光を受けているので同じ割合で割る
-   （服の明暗の傾きも取れる）。割る倍率は flatten_max_gain の範囲に収める
+   （服の明暗の傾きも取れる）。割る倍率は flatten_max_gain の範囲に収める。
+   基準は服の所の明るさ（服の所の倍率の中央値が、色ごとに 1 になるようにする。2026-11-22）。
+   壁の中央値を基準にしていたときは、服が 1.1〜1.5 倍に明るくなり（写真ごとに違い、青のほうが
+   赤より最大 19% 大きい）、カードで合わせた服の色が薄く・正面と背面でずれた
 1. 明るさとレベル補正: 輝度だけにトーンカーブをかけ、RGB の比を保つ（色相を変えない）。収まらない
    色は、色の比を保ったまま明るさを丸めて収める（color.fit_peak）
+   - **カーブは壁（服の外）にだけかける**（2026-11-22）。服は、カードで合わせた明るさのままにする
+     （服の縁は garment_feather_mm でなじませる）。服にもかけていたときは、壁を 94 に上げる分だけ
+     服も明るくなり（壁が暗い写真ほど大きく）、薄く見えた。report の garment_kept が true の
+     ものがこれ
    - 色の濃い明るい服（濃いオレンジなど）は、明るさは収まっても 1 つのチャネルが大きく超え、
      丸めるだけでは濃淡が 255 の手前に詰まって白く飛んで見えた（2026-11-21、River のオレンジ）。
      服の一番大きいチャネルの 99% 点が garment_peak に収まるよう、服だけを同じ倍率で暗くする
@@ -35,7 +42,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .color import fit_peak, to_linear, to_srgb
+from .color import apply_tone, fit_peak, pchip, to_linear, to_srgb
 
 
 @dataclass
@@ -45,7 +52,9 @@ class Finish:
     # 並ぶと青く見えた）
     wall_l: float = 94.0
     wall_ab: tuple[float, float] = (0.0, 0.0)
-    max_gain: float = 1.4  # 壁が暗すぎる写真でも、持ち上げはここまで
+    # 壁が暗すぎる写真でも、持ち上げはここまで（むら取りの基準を服にしたので、壁は前より暗く
+    # 測られる。服にはかけないので、壁を wall_l まで上げられる大きさにする）
+    max_gain: float = 1.65
     black_l: float = 3.0  # 一番暗いところ（0.1% 点）を、この L* まで下げる（レベル補正の黒点）
     black_percentile: float = 0.1
     max_black: float = 20.0  # 0.1% 点がこれより明るい写真では、黒点を動かさない
@@ -72,20 +81,6 @@ class Finish:
     garment_feather_mm: float = 4.0
     # 服だけの明るさの手直し（1 = そのまま）。同じ生地のセットアップの明るさをそろえるときなど
     garment_scale: float = 1.0
-
-
-def _pchip(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """単調な 3 次エルミート補間（Fritsch–Carlson）。値の順序を崩さない。"""
-    h = np.diff(x)
-    d = np.diff(y) / h
-    m = np.zeros_like(y)
-    m[1:-1] = np.where(d[:-1] * d[1:] > 0, 2 / (1 / d[:-1] + 1 / d[1:]), 0)
-    m[0], m[-1] = d[0], d[-1]
-    i = np.clip(np.searchsorted(x, t) - 1, 0, len(h) - 1)
-    s = (t - x[i]) / h[i]
-    h00, h10 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s
-    h01, h11 = -2 * s**3 + 3 * s**2, s**3 - s**2
-    return h00 * y[i] + h10 * h[i] * m[i] + h01 * y[i + 1] + h11 * h[i] * m[i + 1]
 
 
 def tone_curve(
@@ -118,7 +113,7 @@ def tone_curve(
     keep = np.concatenate([[True], np.diff(xs) > 1e-6])
     xs, ys = xs[keep], np.maximum.accumulate(ys[keep])
     grid = np.linspace(0, 100, 1001)
-    return grid, np.clip(_pchip(xs, ys, grid), 0, 100)
+    return grid, np.clip(pchip(xs, ys, grid), 0, 100)
 
 
 def wall_target(params: "Finish", wall_l: float, bright_in: float) -> float:
@@ -198,7 +193,11 @@ def flatten_background(
         keep = resid < max(3 * np.median(resid[keep]), 0.02)
     grid_y, grid_x = np.mgrid[0:h:step, 0:w:step]
     model = _poly_terms(grid_x / w - 0.5, grid_y / h - 0.5, params.flatten_degree) @ coef
-    level = np.median(logs[keep], axis=0)
+    # 服の所の倍率を 1 にする（カードで合わせた服の明るさ・色を変えない）。服が無ければ壁の中央値
+    on_subject = subject[grid_y, grid_x]
+    level = (
+        np.median(model[on_subject], axis=0) if on_subject.any() else np.median(logs[keep], axis=0)
+    )
     gain = np.exp(np.clip(level - model, -np.log(params.flatten_max_gain),
                           np.log(params.flatten_max_gain))).astype(np.float32)  # fmt: skip
     gain = cv2.resize(gain, (w, h), interpolation=cv2.INTER_LINEAR)
@@ -214,9 +213,22 @@ def flatten_background(
 
 
 def finish(
-    image: np.ndarray, subject: np.ndarray, mm_per_px: float, params: Finish
+    image: np.ndarray,
+    subject: np.ndarray,
+    mm_per_px: float,
+    params: Finish,
+    tone: list | np.ndarray | None = None,
+    garment: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict]:
-    """image は書き出す大きさの BGR（0〜1、sRGB）、subject は服・ハンガー・フックの画素。"""
+    """image は書き出す大きさの BGR（0〜1、sRGB）、subject は服・ハンガー・フックの画素。
+
+    garment は服そのものの画素（明るさを変えない所。渡さなければ subject）。subject には板の影の
+    残りなど服でない所も入るので、そこまで「変えない」にすると、壁に灰色のしみが残る。
+
+    tone はカードのグレーに合わせる明るさのカーブ（color.gray_tone）。服にだけかける（壁にかけると、
+    カーブが壁の明るさのわずかな差を 2〜3 倍に広げ、マーカーを消した跡が灰色のしみになった。壁は
+    どのみち wall_l の明るさ・無彩色にそろえるので、今までどおりレベル補正のカーブだけをかける）。
+    """
     core, near = subject_bands(subject, mm_per_px, params.edge_mm)
     background = ~near
     if background.sum() < 1000:
@@ -248,6 +260,12 @@ def finish(
         params.bright_slope,
     )
     out, over = _curve_linear(linear, y, lightness, grid, curve)
+    # 服にはレベル補正のカーブをかけず、カードのグレーに合わせるカーブ（tone）だけをかける
+    # （カードで合わせた明るさのまま）。縁はなじませる
+    sigma = max(params.garment_feather_mm / mm_per_px, 1.0)
+    kept = subject if garment is None else garment
+    weight = np.clip(cv2.GaussianBlur(kept.astype(np.float32), (0, 0), sigma), 0, 1)
+    out = out + (apply_tone(linear, tone) - out) * weight[..., None]
     garment_gain = 1.0
     if core.any():
         peak = float(np.percentile(out[core].max(axis=1), params.garment_percentile))
@@ -255,9 +273,7 @@ def finish(
             garment_gain = max(params.garment_peak / peak, params.garment_min_gain)
     garment_gain *= params.garment_scale
     if garment_gain != 1.0:
-        sigma = max(params.garment_feather_mm / mm_per_px, 1.0)
-        weight = cv2.GaussianBlur(subject.astype(np.float32), (0, 0), sigma)
-        out = out * (1 - (1 - garment_gain) * np.clip(weight, 0, 1))[..., None]
+        out = out * (1 - (1 - garment_gain) * weight)[..., None]
     srgb = to_srgb(fit_peak(out)).astype(np.float32)
 
     # 2. 背景の色味（服の内側には寄せない。縁は、色が壁に近いほど強く）
@@ -277,6 +293,7 @@ def finish(
         "wall_target_l": round(target, 1),
         "out_of_gamut_px": int(over),
         "garment_gain": round(garment_gain, 3),
+        "garment_kept": True,
         "flatten": flat,
     }
     return srgb, report
@@ -309,7 +326,14 @@ def apply_look(image: np.ndarray, look: dict, params: Finish) -> np.ndarray:
     （アップ。closeup.py）にもかける。背景の色味・むら取りは壁がある写真のものなので、かけない。
 
     image は BGR（0〜1、sRGB）。正面と同じ露出・色にそろえてあること。
+
+    正面で服にカーブをかけていないとき（look の garment_kept）は、アップにもかけない（アップは
+    服が写っているので、カードで合わせた明るさのまま。服だけの手直しの倍率とシャープはかける）。
     """
+    if look.get("garment_kept"):
+        linear = to_linear(np.clip(image, 0, 1)).astype(np.float32)
+        out = linear * float(look.get("garment_gain") or 1.0)
+        return _sharpen(to_srgb(fit_peak(out)).astype(np.float32), params)
     wall_l = float(look["wall_lab_before"][0])
     levels = bool(look.get("levels"))
     bright_in = float(look.get("garment_bright_l") or 0.0)

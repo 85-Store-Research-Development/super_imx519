@@ -5,6 +5,13 @@
    - リニア（DNG を現像したもの）: グレー 4 枚（neutral 8〜3.5）でチャネルごとの倍率（WB と露出）
    - 表示用（JPEG など、トーンカーブ済み）: グレー 6 枚で、チャネルごとに lin = a·v^g を当てる
    - どちらも、そのあとにグレーを保つ 3 × 3 の行列（各列の和が 1）を最小二乗で求める
+   - リニアは、最後に明るさのカーブ（tone）: 補正したグレー 5 枚（白〜neutral 3.5）の輝度を基準の
+     輝度に合わせる。iPhone の ProRAW は明るい所が圧縮されていて、倍率 1 つでは白が 0.66 倍・
+     neutral 8 が 0.89 倍・中間が 1.17 倍になり、全体が薄く（中間が明るく、白が暗く）出た
+     （2026-11-22。露出の違う 5 枚で同じ形なので、同じ商品のほかの写真には基準の写真のカーブを
+     使える）。カーブは輝度にかけ、RGB の比は保つ（色相を変えない）。**apply には含めない**:
+     傾きを直し、服を探し、マーカーを消すまでは今までの明るさの画像で行い（しきい値がその明るさに
+     合わせてある）、仕上げの前（finish・closeup）で apply_tone をかける
 3. 基準は OpenCV が持つ ColorChecker Classic の値（cv2.ccm）。互換品の色ずれは補正の誤差になる
 
 画像は RGB の float（0〜1）で扱う。補正の出力はリニアな sRGB。
@@ -23,6 +30,8 @@ NAMES = [
     "white 9.5", "neutral 8", "neutral 6.5", "neutral 5", "neutral 3.5", "black 2",
 ]  # fmt: skip
 GRAYS = [19, 20, 21, 22]  # neutral 8〜3.5。白は飛びやすく、黒はノイズとフレアが乗りやすい
+TONE_GRAYS = [22, 21, 20, 19, 18]  # 暗い順。明るさのカーブを通す（黒はフレアで浮くので使わない）
+LUMA = np.array([0.2126, 0.7152, 0.0722])
 ALL_GRAYS = [18, 19, 20, 21, 22, 23]
 PATCH_INNER = 0.6
 
@@ -52,6 +61,49 @@ def fit_peak(linear: np.ndarray, knee: float = KNEE) -> np.ndarray:
     out = linear.copy()
     out[over] *= (fitted / peak[over])[:, None]
     return out
+
+
+def pchip(x: np.ndarray, y: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """単調な 3 次エルミート補間（Fritsch–Carlson）。値の順序を崩さない。"""
+    h = np.diff(x)
+    d = np.diff(y) / h
+    m = np.zeros_like(y)
+    m[1:-1] = np.where(d[:-1] * d[1:] > 0, 2 / (1 / d[:-1] + 1 / d[1:]), 0)
+    m[0], m[-1] = d[0], d[-1]
+    i = np.clip(np.searchsorted(x, t) - 1, 0, len(h) - 1)
+    s = (t - x[i]) / h[i]
+    h00, h10 = 2 * s**3 - 3 * s**2 + 1, s**3 - 2 * s**2 + s
+    h01, h11 = -2 * s**3 + 3 * s**2, s**3 - s**2
+    return h00 * y[i] + h10 * h[i] * m[i] + h01 * y[i + 1] + h11 * h[i] * m[i + 1]
+
+
+def gray_tone(gained: np.ndarray, ref: np.ndarray) -> np.ndarray | None:
+    """明るさのカーブの点（n × 2。補正したあとの輝度 → 基準の輝度。暗い順）。
+
+    gained は補正（倍率と行列）をかけたパッチの値（24 × 3）。輝度が明るい順に並んでいない点
+    （飛んだ白など）は
+    外す。2 点に満たなければ None（カーブはかけない）。
+    """
+    x, y = gained[TONE_GRAYS] @ LUMA, ref[TONE_GRAYS] @ LUMA
+    keep = [0]
+    for i in range(1, len(x)):
+        if x[i] > x[keep[-1]] * 1.02:
+            keep.append(i)
+    if len(keep) < 2 or x[keep[0]] <= 0:
+        return None
+    return np.stack([x[keep], y[keep]], axis=1)
+
+
+def apply_tone(linear: np.ndarray, tone: np.ndarray | None) -> np.ndarray:
+    """輝度に明るさのカーブをかける（RGB の比は保つ）。点の外側は、端の点の倍率のまま延ばす。"""
+    if tone is None:
+        return linear
+    tone = np.asarray(tone, np.float64)
+    lx, ly = np.log(tone[:, 0]), np.log(tone[:, 1])
+    lum = np.maximum(np.asarray(linear, np.float32) @ LUMA.astype(np.float32), 1e-9)
+    t = np.log(lum).astype(np.float64)
+    out = pchip(lx, ly, np.clip(t, lx[0], lx[-1])) + (t - np.clip(t, lx[0], lx[-1]))
+    return linear * np.exp(out - t).astype(np.float32)[..., None]
 
 
 def to_srgb(linear: np.ndarray) -> np.ndarray:
@@ -158,6 +210,9 @@ class CardCorrection:
     matrix: np.ndarray
     delta_e_before: np.ndarray
     delta_e_after: np.ndarray
+    # linear だけ: 明るさのカーブの点（gray_tone）。apply のあとに apply_tone でかける。
+    # None ならかけない
+    tone: np.ndarray | None = None
 
     def to_linear(self, values: np.ndarray) -> np.ndarray:
         if self.source == "linear":
@@ -182,13 +237,19 @@ class CardCorrection:
             "gain": np.round(self.gain, 4).tolist(),
             "gamma": np.round(self.gamma, 4).tolist(),
             "matrix": np.round(self.matrix, 4).tolist(),
+            "tone": None if self.tone is None else np.round(self.tone, 5).tolist(),
+            "delta_e2000_grays": np.round(self.delta_e_after[ALL_GRAYS], 2).tolist(),
             "delta_e2000_before": summary(self.delta_e_before),
             "delta_e2000_after": summary(self.delta_e_after),
         }
 
 
-def fit_card(measured: np.ndarray, source: str) -> CardCorrection:
-    """measured はパッチの値（24 × 3、RGB）。source は "linear"（リニア）か "display"（sRGB）。"""
+def fit_card(measured: np.ndarray, source: str, tone: np.ndarray | None = None) -> CardCorrection:
+    """measured はパッチの値（24 × 3、RGB）。source は "linear"（リニア）か "display"（sRGB）。
+
+    tone を渡すと、明るさのカーブはそれを使う（同じ商品の基準の写真のもの。露出と WB だけを、
+    この写真のカードで合わせる）。渡さなければ、この写真のグレーから作る。
+    """
     ref = reference_linear()
     ref_lab = srgb_to_lab(to_srgb(ref))
     if source == "linear":
@@ -206,12 +267,16 @@ def fit_card(measured: np.ndarray, source: str) -> CardCorrection:
         gamma = np.array([f[0] for f in fits])
         gain = np.exp([f[1] for f in fits])
         before = measured
+        tone = None
     else:
         raise ValueError(source)
     correction = CardCorrection(source, gain, gamma, np.eye(3), np.zeros(24), np.zeros(24))
     correction.matrix = _gray_preserving_matrix(correction.to_linear(measured), ref)
+    corrected = correction.apply(measured)
+    if source == "linear":
+        correction.tone = gray_tone(corrected, ref) if tone is None else np.asarray(tone, float)
     correction.delta_e_before = delta_e2000(ref_lab, srgb_to_lab(before))
     correction.delta_e_after = delta_e2000(
-        ref_lab, srgb_to_lab(to_srgb(correction.apply(measured)))
+        ref_lab, srgb_to_lab(to_srgb(apply_tone(corrected, correction.tone)))
     )
     return correction

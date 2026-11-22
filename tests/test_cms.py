@@ -68,6 +68,43 @@ def test_reference_from_needs_linear_card_and_exposure():
     assert ref["exposure_scale"] == 2.0 and ref["look"] == {"wall_target_l": 94}
 
 
+def test_reference_carries_the_gray_tone_and_closeups_apply_it():
+    color_report = {
+        "source": "linear",
+        "gain": [2, 2, 2],
+        "gamma": [1, 1, 1],
+        "matrix": np.eye(3).tolist(),
+        "tone": [[0.1, 0.05], [0.8, 0.4]],  # 全体を半分に
+    }
+    ref = closeup.reference_from({"color": color_report}, 1.0)
+    assert ref["tone"] == color_report["tone"]
+    rgb = np.full((2, 2, 3), 0.2, np.float32)
+    out = closeup.correct(
+        rgb, 1.0, ref
+    )  # 倍率 2 → 0.4、カーブで半分 → 0.2。明るさの手直しは 0.225 まで
+    assert np.allclose(out, 0.225, atol=1e-3)
+
+
+def test_reference_is_the_earliest_front_with_a_card():
+    def source(i, role, taken, card=True, status="done"):
+        report = {"color": {"source": "linear", "gain": [i] * 3, "gamma": [1] * 3,
+                            "matrix": np.eye(3).tolist()} if card else None,
+                  "exposure_scale": 1.0}  # fmt: skip
+        return {"id": i, "recipe": "wall", "role": role, "status": status, "report": report,
+                "capture": {"takenAt": taken}, "filename": f"IMG_{i}.DNG"}  # fmt: skip
+
+    sources = [
+        source(1, "back", "2026-11-21T02:00:00Z"),
+        source(2, "front", "2026-11-21T02:05:00Z"),
+        source(3, "front", "2026-11-21T02:01:00Z"),
+        source(4, "front", "2026-11-21T01:59:00Z", card=False),  # カードを検出できなかった正面
+        source(5, "front", "2026-11-21T01:00:00Z", status="pending"),
+    ]
+    assert cms.reference_of(sources)["gain"] == [3, 3, 3]  # 撮影時刻が最初の、カードのある正面
+    assert cms.reference_of([sources[0], sources[3]])["gain"] == [1, 1, 1]  # 正面に無ければ背面
+    assert cms.reference_of([sources[3]]) is None
+
+
 def test_measure_length_and_width_of_a_box():
     mm = 0.5
     garment = np.zeros((2000, 2000), bool)
@@ -114,8 +151,8 @@ def _doc(i, recipe, role, product=1):
 
 
 def _fake_processing(monkeypatch, calls):
-    def wall(src, out):
-        calls.append(("wall", src.name))
+    def wall(src, out, tone=None):
+        calls.append(("wall", src.name, tone))
         out.mkdir(parents=True, exist_ok=True)
         (out / "final.jpg").write_bytes(b"j")
         return {
@@ -124,6 +161,7 @@ def _fake_processing(monkeypatch, calls):
                 "gain": [1, 1, 1],
                 "gamma": [1, 1, 1],
                 "matrix": np.eye(3).tolist(),
+                "tone": [[0.1, 0.1], [0.5, 0.6]],
             },
             "warnings": [],
         }
@@ -152,6 +190,8 @@ def test_front_is_processed_before_closeups_and_gives_them_the_reference(monkeyp
         ("closeup", "IMG_3.DNG"),
     ]
     assert calls[2][2] is True  # 正面の補正を使った
+    # 基準（最初の正面）は自分のカードでカーブを作り、背面は基準のカーブを使う
+    assert calls[0][2] is None and calls[1][2] == [[0.1, 0.1], [0.5, 0.6]]
 
 
 def test_closeups_wait_while_another_worker_processes_the_front(monkeypatch):

@@ -319,12 +319,24 @@ def analyze(
 
 
 def correct_color(
-    rgb: np.ndarray, source: str, white: float, detect: np.ndarray, report: dict
+    rgb: np.ndarray,
+    source: str,
+    white: float,
+    detect: np.ndarray,
+    report: dict,
+    tone: list | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None]:
-    """カラーカードで色を合わせた BGR（0〜255、sRGB）と、カードのパッチの角（無ければ None）。"""
+    """カラーカードで色を合わせた BGR（0〜255、sRGB）と、カードのパッチの角（無ければ None）。
+
+    tone は同じ商品の基準の写真（最初の正面）の明るさのカーブ。渡すと、露出と WB だけをこの写真の
+    カードで合わせ、カーブは基準のものを使う（color.fit_card）。返す画像にカーブはまだかけていない
+    （report["color"]["tone"] に点を残す。仕上げの前にかける）。
+    """
     quads = color.find_card(detect)
     if quads is not None:
-        correction = color.fit_card(color.sample_patches(rgb, quads), source)
+        correction = color.fit_card(
+            color.sample_patches(rgb, quads), source, tone if source == "linear" else None
+        )
         linear = correction.apply(rgb.reshape(-1, 3)).reshape(rgb.shape)
         report["color"] = correction.report()
     else:
@@ -375,8 +387,12 @@ def process_upload(
     composition: framing.Layout | None = None,
     wall_path: Path | None = DEFAULT_WALL,
     look: Finish | None = DEFAULT_LOOK,
+    tone: list | None = None,
 ) -> dict:
-    """look が None なら仕上げ（背景の明るさと色味、シャープ）をかけない。"""
+    """look が None なら仕上げ（背景の明るさと色味、シャープ）をかけない。
+
+    tone は同じ商品の基準の写真の明るさのカーブ（correct_color）。
+    """
     composition = composition or framing.Layout()
     wall_layout = rectify.WallLayout.load(wall_path)
     started = time.time()
@@ -402,7 +418,7 @@ def process_upload(
     detect, white = detection_image(rgb, source)
 
     step(1)
-    bgr, quads = correct_color(rgb, source, white, detect, report)
+    bgr, quads = correct_color(rgb, source, white, detect, report, tone)
     del rgb
 
     step(2)
@@ -416,7 +432,7 @@ def process_upload(
 
     step(3)
     scene = analyze(wall, valid, view, quads, wall_layout)
-    erase, foreground, bbox = scene.erase, scene.foreground, scene.bbox
+    erase, foreground, bbox, garment = scene.erase, scene.foreground, scene.bbox, scene.garment
     hook = hook_position(scene, view, wall_layout, report)
     # 着丈・身幅（おおよそ。measure.py）。測れなくても画像は作る
     try:
@@ -438,7 +454,9 @@ def process_upload(
     if any(pad):
         top, bottom, left, right = pad
         wall = cv2.copyMakeBorder(wall, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
-        valid, foreground = (np.pad(m, ((top, bottom), (left, right))) for m in (valid, foreground))
+        valid, foreground, garment = (
+            np.pad(m, ((top, bottom), (left, right))) for m in (valid, foreground, garment)
+        )
         erase = [np.pad(m, ((top, bottom), (left, right))) for m in erase]
         x0, y0 = x0 + left, y0 + top
     report["crop"] = {
@@ -463,10 +481,20 @@ def process_upload(
 
     step(5)
     final = fit(wall[y0 : y0 + ch, x0 : x0 + cw] / 255, min(composition.side, FINAL_SIDE))
+    # カードのグレーに合わせる明るさのカーブ（ここまでは、今までの明るさの画像で探して消している）
+    curve = (report["color"] or {}).get("tone")
     if look is not None:
         subject = foreground[y0 : y0 + ch, x0 : x0 + cw].astype(np.float32)
         subject = cv2.resize(subject, final.shape[1::-1], interpolation=cv2.INTER_AREA) > 0.1
-        final, report["finish"] = finish(final, subject, cw * mm / final.shape[1], look)
+        # 服そのもの（前景には、板の影の残りなど服でない所も入る。そこは壁として明るくする）
+        keep = (garment & ~filler.filled)[y0 : y0 + ch, x0 : x0 + cw].astype(np.float32)
+        keep = cv2.resize(keep, final.shape[1::-1], interpolation=cv2.INTER_AREA) > 0.1
+        final, report["finish"] = finish(
+            final, subject, cw * mm / final.shape[1], look, curve, keep
+        )
+    elif curve:
+        toned = color.apply_tone(color.to_linear(np.clip(final, 0, 1)).astype(np.float32), curve)
+        final = color.to_srgb(color.fit_peak(toned)).astype(np.float32)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_jpeg(out_dir / "preview.jpg", fit(final, PREVIEW_SIDE), 85)
     report["final_size"] = [final.shape[1], final.shape[0]]
