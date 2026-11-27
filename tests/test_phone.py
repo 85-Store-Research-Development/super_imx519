@@ -467,3 +467,19 @@ def test_garments_close_to_the_wall_color_are_treated_like_the_wall():
         ) == pytest.approx(ratios[name], rel=0.05)
     assert ratios["navy"] == pytest.approx(0.8, abs=0.02)  # 壁と違う色の服: カードのカーブだけ
     assert ratios["gray"] > 1.3  # 壁に近いグレー: 壁と同じカーブで明るくなる（今までどおり）
+
+
+def test_gray_tone_uses_black_and_drops_a_steep_white():
+    """黒も通す（フレアで浮いた黒を戻す）。白がカードの所で詰まっていても、明るい所を広げすぎない。"""
+    ref = color.reference_linear()
+    y = ref @ color.LUMA
+    measured = ref.copy()
+    measured[23] = ref[23] * 1.8  # フレアで浮いた黒
+    measured[18] = ref[18] * (y[19] * 1.05 / y[18])  # 白が neutral 8 のすぐ上まで詰まった
+    c = color.fit_card(measured * 0.1, "linear")
+    tone = np.asarray(c.tone)
+    assert len(tone) == 5  # 黒〜neutral 8（白は外す）
+    out = color.apply_tone(c.apply(measured * 0.1), c.tone) @ color.LUMA
+    assert out[23] == pytest.approx(y[23], rel=0.05)
+    # neutral 8 より明るい所は、neutral 8 の倍率のまま（白を基準まで持ち上げない）
+    assert out[18] / out[19] == pytest.approx(1.05, rel=0.03)
