@@ -438,3 +438,48 @@ def test_finish_garment_scale_changes_only_the_garment():
     assert r2["garment_gain"] == pytest.approx(r1["garment_gain"] * 0.8)
     assert np.allclose(dark[20:100, 20:100], base[20:100, 20:100], atol=1e-3)  # 壁は同じ
     assert dark[300, 200].mean() < base[300, 200].mean()
+
+
+def test_garments_close_to_the_wall_color_are_treated_like_the_wall():
+    """白やグレーの服は壁と同じに扱う（服と壁でかけ方を分けると、判定のずれが白い抜けになる）。"""
+    from super_imx519.pipeline.color import to_linear
+    from super_imx519.pipeline.finish import Finish, apply_look, finish
+
+    def scene(garment_lab):
+        lab = np.zeros((600, 400, 3), np.float32)
+        lab[...] = (70, 0, 0)
+        lab[150:450, 100:300] = garment_lab
+        garment = np.zeros((600, 400), bool)
+        garment[150:450, 100:300] = True
+        return np.clip(cv2.cvtColor(lab, cv2.COLOR_Lab2BGR), 0, 1), garment
+
+    look = Finish(sharpen=0, flatten=False)
+    tone = [[0.05, 0.04], [0.5, 0.4]]  # 服にかけるカードのカーブ（0.8 倍）
+    ratios = {}
+    for name, garment_lab in (("navy", (25, 5, -30)), ("gray", (62, 0, 0))):
+        image, garment = scene(garment_lab)
+        out, report = finish(image, garment, 1.0, look, tone, garment)
+        ratios[name] = float((to_linear(out)[300, 200] / to_linear(image)[300, 200]).mean())
+        # アップ（服の範囲が分からない）も、同じ規則になる
+        up = apply_look(image, report, look, tone)
+        assert float(
+            (to_linear(up)[300, 200] / to_linear(image)[300, 200]).mean()
+        ) == pytest.approx(ratios[name], rel=0.05)
+    assert ratios["navy"] == pytest.approx(0.8, abs=0.02)  # 壁と違う色の服: カードのカーブだけ
+    assert ratios["gray"] > 1.3  # 壁に近いグレー: 壁と同じカーブで明るくなる（今までどおり）
+
+
+def test_gray_tone_uses_black_and_drops_a_steep_white():
+    """黒も通す（フレアで浮いた黒を戻す）。白がカードの所で詰まっていても、明るい所を広げすぎない。"""
+    ref = color.reference_linear()
+    y = ref @ color.LUMA
+    measured = ref.copy()
+    measured[23] = ref[23] * 1.8  # フレアで浮いた黒
+    measured[18] = ref[18] * (y[19] * 1.05 / y[18])  # 白が neutral 8 のすぐ上まで詰まった
+    c = color.fit_card(measured * 0.1, "linear")
+    tone = np.asarray(c.tone)
+    assert len(tone) == 5  # 黒〜neutral 8（白は外す）
+    out = color.apply_tone(c.apply(measured * 0.1), c.tone) @ color.LUMA
+    assert out[23] == pytest.approx(y[23], rel=0.05)
+    # neutral 8 より明るい所は、neutral 8 の倍率のまま（白を基準まで持ち上げない）
+    assert out[18] / out[19] == pytest.approx(1.05, rel=0.03)

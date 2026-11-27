@@ -68,7 +68,7 @@ def test_reference_from_needs_linear_card_and_exposure():
     assert ref["exposure_scale"] == 2.0 and ref["look"] == {"wall_target_l": 94}
 
 
-def test_reference_carries_the_gray_tone_and_closeups_apply_it():
+def test_reference_carries_the_gray_tone_and_correct_leaves_it_to_the_finish():
     color_report = {
         "source": "linear",
         "gain": [2, 2, 2],
@@ -78,11 +78,9 @@ def test_reference_carries_the_gray_tone_and_closeups_apply_it():
     }
     ref = closeup.reference_from({"color": color_report}, 1.0)
     assert ref["tone"] == color_report["tone"]
+    # correct はカーブをかけない（仕上げでかける）: 倍率 2 → 0.4
     rgb = np.full((2, 2, 3), 0.2, np.float32)
-    out = closeup.correct(
-        rgb, 1.0, ref
-    )  # 倍率 2 → 0.4、カーブで半分 → 0.2。明るさの手直しは 0.225 まで
-    assert np.allclose(out, 0.225, atol=1e-3)
+    assert np.allclose(closeup.correct(rgb, 1.0, ref), 0.4, atol=1e-3)
 
 
 def test_reference_is_the_earliest_front_with_a_card():

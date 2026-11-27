@@ -30,7 +30,13 @@ NAMES = [
     "white 9.5", "neutral 8", "neutral 6.5", "neutral 5", "neutral 3.5", "black 2",
 ]  # fmt: skip
 GRAYS = [19, 20, 21, 22]  # neutral 8〜3.5。白は飛びやすく、黒はノイズとフレアが乗りやすい
-TONE_GRAYS = [22, 21, 20, 19, 18]  # 暗い順。明るさのカーブを通す（黒はフレアで浮くので使わない）
+# 暗い順。明るさのカーブを通す。黒も通す（フレアで浮いた黒を基準に戻す。通さないと、紺・黒の服が
+# 白っぽくかすんだ。2026-11-22 の写真で黒のパッチが L* 20 → 26）
+TONE_GRAYS = [23, 22, 21, 20, 19, 18]
+# カーブの明るい側の傾き（対数どうし）の上限。超える点は外す（その先は手前の点の倍率のまま延ばす）。
+# ProRAW の白は、カードの所で局所的に強く詰まる（2026-11-22 は白と neutral 8 が L* 80 と 77）。
+# それを全体に戻すと、白の手前で濃淡が 6 倍に広がり、明るい生地・服のつやが白く飛んだ
+MAX_TONE_SLOPE = 2.5
 LUMA = np.array([0.2126, 0.7152, 0.0722])
 ALL_GRAYS = [18, 19, 20, 21, 22, 23]
 PATCH_INNER = 0.6
@@ -81,7 +87,8 @@ def gray_tone(gained: np.ndarray, ref: np.ndarray) -> np.ndarray | None:
     """明るさのカーブの点（n × 2。補正したあとの輝度 → 基準の輝度。暗い順）。
 
     gained は補正（倍率と行列）をかけたパッチの値（24 × 3）。輝度が明るい順に並んでいない点
-    （飛んだ白など）は外す。2 点に満たなければ None（カーブはかけない）。
+    （飛んだ白など）と、明るい側で傾きが MAX_TONE_SLOPE を超える点は外す。2 点に満たなければ
+    None（カーブはかけない）。
     """
     x, y = gained[TONE_GRAYS] @ LUMA, ref[TONE_GRAYS] @ LUMA
     keep = [0]
@@ -90,7 +97,13 @@ def gray_tone(gained: np.ndarray, ref: np.ndarray) -> np.ndarray | None:
             keep.append(i)
     if len(keep) < 2 or x[keep[0]] <= 0:
         return None
-    return np.stack([x[keep], y[keep]], axis=1)
+    points = np.stack([x[keep], y[keep]], axis=1)
+    while len(points) > 2:
+        (x0, y0), (x1, y1) = points[-2], points[-1]
+        if np.log(y1 / y0) <= MAX_TONE_SLOPE * np.log(x1 / x0):
+            break
+        points = points[:-1]
+    return points
 
 
 def apply_tone(linear: np.ndarray, tone: np.ndarray | None) -> np.ndarray:

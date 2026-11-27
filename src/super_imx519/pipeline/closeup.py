@@ -44,7 +44,11 @@ def reference_from(report: dict, scale: float | None) -> dict | None:
 def correct(
     rgb: np.ndarray, scale: float | None, reference: dict | None, floor_stops: float = 2.0
 ) -> np.ndarray:
-    """リニアな RGB（0〜1。DNG を現像したもの）→ 補正したリニアな sRGB。"""
+    """リニアな RGB（0〜1。DNG を現像したもの）→ 補正したリニアな sRGB。
+
+    カードのグレーに合わせるカーブ（reference の tone）は、まだかけていない
+    （process_closeup が、仕上げと一緒にかける）。
+    """
     ref_scale = reference.get("exposure_scale") if reference else None
     correction = color.CardCorrection(
         "linear",
@@ -56,7 +60,6 @@ def correct(
     )
     values = rgb * (ref_scale / scale)
     out = correction.apply(values.reshape(-1, 3)).reshape(rgb.shape)
-    out = color.apply_tone(out, reference.get("tone"))
     return out * brightness_factor(out, floor_stops)
 
 
@@ -108,15 +111,18 @@ def process_closeup(
     report["source"] = source
     report["source_size"] = [rgb.shape[1], rgb.shape[0]]
     scale = exposure.exposure_scale(src) if source == "linear" else None
+    tone = None  # カードのグレーに合わせるカーブ（仕上げでかける）
     report["exposure_scale"] = scale
     card = own_card(rgb, source, reference)
     if card is not None:
         # この写真のカードで露出と WB を合わせる（実際の明るさなので、明るさの手直しはしない）
-        linear = color.apply_tone(card.apply(rgb.reshape(-1, 3)).reshape(rgb.shape), card.tone)
+        linear = card.apply(rgb.reshape(-1, 3)).reshape(rgb.shape)
+        tone = card.tone
         report["color"] = {**card.report(), "from": "card"}
     elif source == "linear" and scale and reference and reference.get("exposure_scale"):
         floor = TAG_FLOOR_STOPS if label == TAG_LABEL else 2.0
         linear = correct(rgb, scale, reference, floor)
+        tone = reference.get("tone")
         report["color"] = {
             "from": "reference",
             "ratio": round(reference["exposure_scale"] / scale, 4),
@@ -137,9 +143,13 @@ def process_closeup(
             else color.to_linear(rgb)
         )
         report["color"] = None
+    look = reference.get("look") if report["color"] and reference else None
+    if look is None:
+        linear = color.apply_tone(linear, tone)
     srgb = color.to_srgb(color.fit_peak(linear))[..., ::-1]  # BGR
-    if report["color"] and reference and reference.get("look"):
-        srgb = apply_look(np.ascontiguousarray(srgb, np.float32), reference["look"], Finish())
+    if look is not None:
+        # 正面と同じ仕上げ（服はカードのカーブだけ、壁の色に近い所は今までどおりのカーブ）
+        srgb = apply_look(np.ascontiguousarray(srgb, np.float32), look, Finish(), tone)
         report["look"] = "reference"
     final = fit(srgb, FINAL_SIDE)
     out_dir.mkdir(parents=True, exist_ok=True)
